@@ -1,0 +1,113 @@
+/**
+ * The platform-neutral domain model. Everything above the connector layer
+ * (store, API, web UI, insights) speaks only these types, so adding a new
+ * messaging service means writing a connector or importer, nothing else.
+ *
+ * This file is shared with the web client, so it must stay free of Node imports.
+ */
+
+export type Platform = 'whatsapp' | 'instagram';
+
+/**
+ * `live` conversations come from a running connector and can usually be replied to.
+ * `import` conversations are read-only snapshots loaded from an export file.
+ */
+export type SourceKind = 'live' | 'import';
+
+export interface Participant {
+  /** Platform-native id: a WhatsApp JID, an Instagram id, or the display name for imports. */
+  id: string;
+  name: string;
+  isSelf: boolean;
+}
+
+export interface Conversation {
+  /** `${sourceId}:${nativeId}`, stable across restarts. */
+  id: string;
+  /** Which connector or importer produced it, e.g. `whatsapp` or `import:instagram`. */
+  sourceId: string;
+  sourceKind: SourceKind;
+  platform: Platform;
+  nativeId: string;
+  title: string;
+  isGroup: boolean;
+  participants: Participant[];
+  lastMessageAt: number | null;
+  lastMessagePreview: string | null;
+  unreadCount: number;
+  messageCount: number;
+}
+
+export type MessageKind = 'text' | 'media' | 'system';
+
+export type AttachmentType =
+  'image' | 'video' | 'audio' | 'sticker' | 'document' | 'location' | 'contact' | 'link' | 'other';
+
+export interface Attachment {
+  type: AttachmentType;
+  name?: string;
+  mimeType?: string;
+  /** Served by this app (`/api/media/...`) or an external link. Absent when the file wasn't available. */
+  url?: string;
+}
+
+export interface Reaction {
+  emoji: string;
+  senderId: string;
+  senderName: string;
+}
+
+export type DeliveryStatus = 'pending' | 'sent' | 'delivered' | 'read' | 'failed';
+
+export interface Message {
+  /** `${conversationId}:${nativeId}` */
+  id: string;
+  conversationId: string;
+  nativeId: string;
+  senderId: string;
+  senderName: string;
+  fromSelf: boolean;
+  /** Milliseconds since the epoch. */
+  timestamp: number;
+  kind: MessageKind;
+  text: string | null;
+  attachments: Attachment[];
+  reactions: Reaction[];
+  replyToNativeId: string | null;
+  status: DeliveryStatus | null;
+  edited: boolean;
+  deleted: boolean;
+}
+
+export type ConnectorState = 'stopped' | 'starting' | 'awaiting_auth' | 'connected' | 'reconnecting' | 'error';
+
+export interface ConnectorCapabilities {
+  send: boolean;
+  liveUpdates: boolean;
+}
+
+export interface ConnectorStatus {
+  id: string;
+  platform: Platform;
+  label: string;
+  state: ConnectorState;
+  capabilities: ConnectorCapabilities;
+  /** Human-readable detail: an error message, sync progress, the linked account. */
+  detail?: string;
+  /** A pairing QR code as a data: URL, while `state` is `awaiting_auth`. */
+  qr?: string;
+}
+
+export interface MessagePage {
+  messages: Message[];
+  /** Pass back as `before` to load older messages; null when there are none. */
+  nextCursor: string | null;
+}
+
+export type HubEvent =
+  | { type: 'conversation.upserted'; conversation: Conversation }
+  | { type: 'conversation.deleted'; conversationId: string }
+  | { type: 'message.upserted'; message: Message }
+  /** Many messages changed at once (history sync, import); clients should reload the conversation. */
+  | { type: 'messages.bulk'; conversationId: string }
+  | { type: 'connector.status'; status: ConnectorStatus };
