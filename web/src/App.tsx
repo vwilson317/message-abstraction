@@ -1,18 +1,13 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
-import { api, type Conversation, type ConnectorStatus } from './api';
-import { AccountsDialog } from './components/AccountsDialog';
+import { useEffect, useMemo, useState } from 'react';
+import { SourcesDialog } from './components/SourcesDialog';
 import { ImportDialog } from './components/ImportDialog';
 import { InsightsPanel } from './components/InsightsPanel';
 import { Sidebar } from './components/Sidebar';
 import { Thread } from './components/Thread';
 import { Toasts, useToasts } from './components/Toasts';
-import { subscribe } from './events';
+import { useInbox } from './useInbox';
 
-type Dialog = 'accounts' | 'import' | null;
-
-function sortConversations(list: Conversation[]): Conversation[] {
-  return [...list].sort((a, b) => (b.lastMessageAt ?? -Infinity) - (a.lastMessageAt ?? -Infinity));
-}
+type Dialog = 'sources' | 'import' | null;
 
 function readHash(): string | null {
   const id = decodeURIComponent(window.location.hash.slice(1));
@@ -20,49 +15,14 @@ function readHash(): string | null {
 }
 
 export function App() {
-  const [conversations, setConversations] = useState<Conversation[]>([]);
-  const [connectors, setConnectors] = useState<ConnectorStatus[]>([]);
-  const [loaded, setLoaded] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(readHash);
   const [dialog, setDialog] = useState<Dialog>(null);
   const [showInsights, setShowInsights] = useState(() => window.matchMedia('(min-width: 1200px)').matches);
   const toasts = useToasts();
   const showError = toasts.error;
-
-  const refresh = useCallback(async () => {
-    try {
-      const [convs, conns] = await Promise.all([api.conversations(), api.connectors()]);
-      setConversations(sortConversations(convs));
-      setConnectors(conns);
-    } catch (err) {
-      showError(`Couldn't reach the server: ${(err as Error).message}`);
-    } finally {
-      setLoaded(true);
-    }
-  }, [showError]);
-
-  useEffect(() => {
-    void refresh();
-    return subscribe((event) => {
-      switch (event.type) {
-        case 'stream.open':
-          void refresh();
-          break;
-        case 'conversation.upserted':
-          setConversations((list) =>
-            sortConversations([...list.filter((c) => c.id !== event.conversation.id), event.conversation]),
-          );
-          break;
-        case 'conversation.deleted':
-          setConversations((list) => list.filter((c) => c.id !== event.conversationId));
-          setSelectedId((id) => (id === event.conversationId ? null : id));
-          break;
-        case 'connector.status':
-          setConnectors((list) => list.map((c) => (c.id === event.status.id ? event.status : c)));
-          break;
-      }
-    });
-  }, [refresh]);
+  const { conversations, connectors, loaded } = useInbox(showError, (id) =>
+    setSelectedId((current) => (current === id ? null : current)),
+  );
 
   // Keep the open conversation in the URL so a reload lands in the same place.
   useEffect(() => {
@@ -81,8 +41,7 @@ export function App() {
         loaded={loaded}
         selectedId={selectedId}
         onSelect={setSelectedId}
-        onOpenAccounts={() => setDialog('accounts')}
-        onOpenImport={() => setDialog('import')}
+        onOpenSources={() => setDialog('sources')}
       />
 
       {selected ? (
@@ -90,17 +49,19 @@ export function App() {
           key={`thread:${selected.id}`}
           conversation={selected}
           connector={connector}
-          insightsOpen={showInsights}
-          onToggleInsights={() => setShowInsights((v) => !v)}
-          onBack={() => setSelectedId(null)}
-          onOpenAccounts={() => setDialog('accounts')}
+          header={{
+            insightsOpen: showInsights,
+            onToggleInsights: () => setShowInsights((v) => !v),
+            onBack: () => setSelectedId(null),
+          }}
+          onOpenSources={() => setDialog('sources')}
           onError={showError}
         />
       ) : (
         <main className="thread thread-empty">
           <Welcome
             hasConversations={conversations.length > 0}
-            onConnect={() => setDialog('accounts')}
+            onSources={() => setDialog('sources')}
             onImport={() => setDialog('import')}
           />
         </main>
@@ -116,8 +77,8 @@ export function App() {
         />
       )}
 
-      {dialog === 'accounts' && (
-        <AccountsDialog
+      {dialog === 'sources' && (
+        <SourcesDialog
           connectors={connectors}
           onClose={() => setDialog(null)}
           onImport={() => setDialog('import')}
@@ -138,7 +99,7 @@ export function App() {
   );
 }
 
-function Welcome(props: { hasConversations: boolean; onConnect: () => void; onImport: () => void }) {
+function Welcome(props: { hasConversations: boolean; onSources: () => void; onImport: () => void }) {
   if (props.hasConversations) {
     return (
       <div className="welcome">
@@ -148,13 +109,14 @@ function Welcome(props: { hasConversations: boolean; onConnect: () => void; onIm
   }
   return (
     <div className="welcome">
-      <h1>One inbox for WhatsApp and Instagram</h1>
+      <h1>Insights beside the chats you already have open</h1>
       <p>
-        Link WhatsApp to read and reply live, or import chat exports from either app. Everything stays on this machine.
+        Inbox reads WhatsApp Desktop on your Mac and Instagram in Chrome, read-only, and keeps everything on this
+        computer. You keep chatting in the apps.
       </p>
       <div className="welcome-actions">
-        <button className="btn btn-primary" onClick={props.onConnect}>
-          Connect WhatsApp
+        <button className="btn btn-primary" onClick={props.onSources}>
+          Set up sources
         </button>
         <button className="btn" onClick={props.onImport}>
           Import an export

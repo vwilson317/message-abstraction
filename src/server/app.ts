@@ -15,6 +15,8 @@ import { formatTranscript } from '../insights/transcript';
 export interface AppOptions {
   /** Host names (without port) this server answers to. Guards against DNS rebinding. */
   allowedHosts: string[];
+  /** Extension ids allowed to push captures; empty allows any chrome-extension:// origin. */
+  extensionIds: string[];
   maxUploadBytes: number;
   /** Built web client to serve, if any. */
   staticDir?: string;
@@ -27,8 +29,13 @@ const SAFE_INLINE = /^(image\/(jpeg|png|gif|webp|heic)|video\/|audio\/)/;
  * web page on another origin could trigger: unknown Host headers (DNS
  * rebinding) and cross-site writes (CSRF).
  */
-function localOnly(allowedHosts: string[]): MiddlewareHandler {
+const EXTENSION_ROUTE = /^\/api\/connectors\/[^/]+\/(captures|heartbeat)$/;
+
+function localOnly(allowedHosts: string[], extensionIds: string[]): MiddlewareHandler {
   const allowed = new Set(allowedHosts.map((h) => h.toLowerCase()));
+  const extensionAllowed = (origin: string) =>
+    origin.startsWith('chrome-extension://') &&
+    (extensionIds.length === 0 || extensionIds.includes(origin.slice('chrome-extension://'.length)));
   return async (c, next) => {
     const hostHeader = c.req.header('host') ?? '';
     const host = hostHeader.replace(/:\d+$/, '').toLowerCase();
@@ -36,14 +43,31 @@ function localOnly(allowedHosts: string[]): MiddlewareHandler {
     if (!['GET', 'HEAD', 'OPTIONS'].includes(c.req.method)) {
       const site = c.req.header('sec-fetch-site');
       const origin = c.req.header('origin');
-      if (site && site !== 'same-origin' && site !== 'none')
-        return c.json({ error: 'Cross-site request refused' }, 403);
-      if (origin && origin !== 'null' && new URL(origin).host !== hostHeader) {
-        return c.json({ error: 'Cross-origin request refused' }, 403);
+      // Web pages can't claim a chrome-extension:// origin, so this doesn't reopen CSRF.
+      const fromExtension = !!origin && extensionAllowed(origin) && EXTENSION_ROUTE.test(c.req.path);
+      if (!fromExtension) {
+        if (site && site !== 'same-origin' && site !== 'none') {
+          return c.json({ error: 'Cross-site request refused' }, 403);
+        }
+        if (origin && origin !== 'null' && new URL(origin).host !== hostHeader) {
+          return c.json({ error: 'Cross-origin request refused' }, 403);
+        }
       }
     }
     await next();
   };
+}
+
+/** Media can come from exports or another app's folders, so it's never trusted to run. */
+async function mediaResponse(c: Context, path: string): Promise<Response> {
+  const type = mimeForFile(path) ?? 'application/octet-stream';
+  return c.body(await readFile(path), 200, {
+    'Content-Type': type,
+    'Content-Disposition': SAFE_INLINE.test(type) ? 'inline' : 'attachment',
+    'Content-Security-Policy': 'sandbox',
+    'X-Content-Type-Options': 'nosniff',
+    'Cache-Control': 'private, max-age=31536000, immutable',
+  });
 }
 
 async function jsonBody<T>(c: Context): Promise<Partial<T>> {
@@ -68,7 +92,7 @@ export function createApp(hub: Hub, options: AppOptions): Hono {
     console.error(err);
     return c.json({ error: err.message || 'Internal error' }, 500);
   });
-  app.use('*', localOnly(options.allowedHosts));
+  app.use('*', localOnly(options.allowedHosts, options.extensionIds));
 
   const api = new Hono();
 
@@ -80,12 +104,23 @@ export function createApp(hub: Hub, options: AppOptions): Hono {
     await hub.startConnector(c.req.param('id'));
     return c.json({ ok: true });
   });
-  api.post('/connectors/:id/disconnect', async (c) => {
-    await hub.stopConnector(c.req.param('id'));
+  api.get('/connectors/:id/media/:ref', async (c) => {
+    const path = hub.connectorMediaFile(c.req.param('id'), c.req.param('ref'));
+    if (!path) return c.json({ error: 'Not found' }, 404);
+    return mediaResponse(c, path);
+  });
+  // The browser extension pushes what it reads from a tab. Its requests carry a
+  // chrome-extension:// origin, which localOnly() lets through for these two routes.
+  api.post('/connectors/:id/captures', async (c) => {
+    const body = await jsonBody<unknown>(c);
+    return c.json(hub.receive(c.req.param('id'), body));
+  });
+  api.post('/connectors/:id/heartbeat', (c) => {
+    hub.heartbeat(c.req.param('id'));
     return c.json({ ok: true });
   });
-  api.post('/connectors/:id/logout', async (c) => {
-    await hub.logoutConnector(c.req.param('id'));
+  api.post('/connectors/:id/disconnect', async (c) => {
+    await hub.stopConnector(c.req.param('id'));
     return c.json({ ok: true });
   });
 
@@ -109,12 +144,6 @@ export function createApp(hub: Hub, options: AppOptions): Hono {
     const limit = optionalNumber(c.req.query('limit'));
     return c.json(hub.store.listMessages(id, { ...(before && { before }), ...(limit && { limit }) }));
   });
-  api.post('/conversations/:id/messages', async (c) => {
-    const body = await jsonBody<{ text: string }>(c);
-    if (typeof body.text !== 'string') throw new HubError('"text" is required');
-    return c.json(await hub.sendText(c.req.param('id'), body.text), 201);
-  });
-
   // ── Insights ────────────────────────────────────────────────────────────
   api.get('/conversations/:id/insights', (c) => {
     const conversation = hub.requireConversation(c.req.param('id'));
@@ -168,14 +197,7 @@ export function createApp(hub: Hub, options: AppOptions): Hono {
   api.get('/media/:file', async (c) => {
     const path = hub.media.resolve(c.req.param('file'));
     if (!path) return c.json({ error: 'Not found' }, 404);
-    const type = mimeForFile(path) ?? 'application/octet-stream';
-    return c.body(await readFile(path), 200, {
-      'Content-Type': type,
-      'Content-Disposition': SAFE_INLINE.test(type) ? 'inline' : 'attachment',
-      'Content-Security-Policy': 'sandbox',
-      'X-Content-Type-Options': 'nosniff',
-      'Cache-Control': 'private, max-age=31536000, immutable',
-    });
+    return mediaResponse(c, path);
   });
 
   // ── Live updates ────────────────────────────────────────────────────────
@@ -196,6 +218,13 @@ export function createApp(hub: Hub, options: AppOptions): Hono {
   app.route('/api', api);
 
   if (options.staticDir && existsSync(options.staticDir)) {
+    // Only this app and the extension's side panel may frame the UI (no clickjacking).
+    app.use('/*', async (c, next) => {
+      await next();
+      if (c.res.headers.get('content-type')?.startsWith('text/html')) {
+        c.res.headers.set('Content-Security-Policy', "frame-ancestors 'self' chrome-extension:");
+      }
+    });
     // serveStatic resolves `root` against the working directory.
     const root = relative(process.cwd(), options.staticDir) || '.';
     app.use('/*', serveStatic({ root }));

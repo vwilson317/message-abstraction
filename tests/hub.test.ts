@@ -18,30 +18,17 @@ class FakeConnector implements Connector {
   readonly id = 'fake';
   readonly platform = 'whatsapp' as const;
   readonly label = 'Fake';
-  readonly capabilities = { send: true, liveUpdates: true };
   ctx?: ConnectorContext;
-  sent: string[] = [];
-  async hasSession() {
-    return false;
+  stopped = false;
+  async shouldAutoStart() {
+    return true;
   }
   async start(ctx: ConnectorContext) {
     this.ctx = ctx;
-    ctx.setStatus({ state: 'connected', detail: 'ok' });
+    ctx.setStatus({ state: 'connected', detail: 'watching' });
   }
-  async stop() {}
-  async logout() {}
-  async sendText(conversationNativeId: string, text: string): Promise<MessageInput> {
-    this.sent.push(text);
-    return msg({
-      conversationNativeId,
-      nativeId: `out-${this.sent.length}`,
-      text,
-      fromSelf: true,
-      senderId: 'me',
-      senderName: 'You',
-      timestamp: 5_000,
-      status: 'sent',
-    });
+  async stop() {
+    this.stopped = true;
   }
 }
 
@@ -152,22 +139,22 @@ describe('Hub', () => {
     expect(() => hub.setSelf('import:whatsapp:chat', 'Nobody')).toThrow(/not a participant/);
   });
 
-  it('routes sends through the owning connector and refuses read-only imports', async () => {
-    const { hub } = makeHub();
+  it('starts connectors at boot, namespaces what they report, and stops them', async () => {
+    const { hub, events } = makeHub();
     const fake = new FakeConnector();
     hub.register(fake);
-    await hub.startConnector('fake');
+    await hub.autoStart();
+    expect(hub.connectorStatuses()).toEqual([
+      { id: 'fake', platform: 'whatsapp', label: 'Fake', state: 'connected', detail: 'watching' },
+    ]);
     fake.ctx!.upsertConversation({ platform: 'whatsapp', nativeId: 'alice', title: 'Alice' });
+    fake.ctx!.upsertMessages([msg()], { countUnread: true });
+    expect(hub.requireConversation('fake:alice')).toMatchObject({ sourceKind: 'live', unreadCount: 1 });
 
-    const sent = await hub.sendText('fake:alice', '  hello  ');
-    expect(fake.sent).toEqual(['hello']);
-    expect(sent).toMatchObject({ id: 'fake:alice:out-1', fromSelf: true, status: 'sent' });
-    expect(hub.requireConversation('fake:alice').lastMessagePreview).toBe('You: hello');
-
-    hub.upsertConversation('import:whatsapp', 'import', { platform: 'whatsapp', nativeId: 'old' });
-    await expect(hub.sendText('import:whatsapp:old', 'hi')).rejects.toThrow(/read-only/);
+    await hub.startConnector('fake'); // already running: no second start
     await hub.stopConnector('fake');
-    await expect(hub.sendText('fake:alice', 'hi')).rejects.toThrow(/not connected/);
+    expect(fake.stopped).toBe(true);
+    expect(events.filter((e) => e.type === 'connector.status').at(-1)).toMatchObject({ status: { state: 'stopped' } });
   });
 
   it('deletes a conversation and its messages', () => {

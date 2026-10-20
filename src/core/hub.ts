@@ -73,7 +73,6 @@ export class Hub {
       id: connector.id,
       platform: connector.platform,
       label: connector.label,
-      capabilities: connector.capabilities,
       state: 'stopped',
     });
   }
@@ -82,10 +81,10 @@ export class Hub {
     return [...this.statuses.values()];
   }
 
-  /** Start every connector that already has saved credentials. */
+  /** Start every connector whose app looks present on this machine. */
   async autoStart(): Promise<void> {
     for (const connector of this.connectors.values()) {
-      if (await connector.hasSession(this.dirFor(connector))) await this.startConnector(connector.id);
+      if (await connector.shouldAutoStart(this.dirFor(connector))) await this.startConnector(connector.id);
     }
   }
 
@@ -101,13 +100,26 @@ export class Hub {
     this.updateStatus(id, { state: 'stopped' });
   }
 
-  async logoutConnector(id: string): Promise<void> {
-    await this.requireConnector(id).logout();
-    this.updateStatus(id, { state: 'stopped', detail: 'Logged out' });
-  }
-
   async stopAll(): Promise<void> {
     await Promise.allSettled([...this.connectors.values()].map((c) => c.stop()));
+  }
+
+  /** Hand a browser-extension capture to the source it belongs to. */
+  receive(id: string, body: unknown): { conversationId: string; added: number } {
+    const connector = this.requireConnector(id);
+    if (!connector.receive) throw new HubError(`${connector.label} doesn't accept captures`, 404);
+    return connector.receive(body);
+  }
+
+  heartbeat(id: string): void {
+    const connector = this.requireConnector(id);
+    if (!connector.heartbeat) throw new HubError(`${connector.label} doesn't take heartbeats`, 404);
+    connector.heartbeat();
+  }
+
+  /** A media file a connector serves from its app's own storage, if it has one. */
+  connectorMediaFile(id: string, ref: string): string | null {
+    return this.requireConnector(id).mediaFile?.(ref) ?? null;
   }
 
   private requireConnector(id: string): Connector {
@@ -119,15 +131,13 @@ export class Hub {
   private updateStatus(id: string, patch: Partial<ConnectorStatus>): void {
     const current = this.statuses.get(id);
     if (!current) return;
-    // Fields like `qr` and `detail` only make sense for the state they arrived with.
+    // `detail` only makes sense for the state it arrived with.
     const next: ConnectorStatus = {
       id: current.id,
       platform: current.platform,
       label: current.label,
-      capabilities: current.capabilities,
       state: patch.state ?? current.state,
       ...(patch.detail !== undefined && { detail: patch.detail }),
-      ...(patch.qr !== undefined && { qr: patch.qr }),
     };
     this.statuses.set(id, next);
     this.emit({ type: 'connector.status', status: next });
@@ -180,6 +190,8 @@ export class Hub {
         const id = `${conversationId}:${input.nativeId}`;
         const existing = this.store.getMessage(id);
         const message = existing ? mergeMessage(existing, input) : newMessage(id, conversationId, input);
+        // Mirrors re-read the same rows often; unchanged rows cost no write and no event.
+        if (existing && sameMessage(existing, message)) continue;
         this.store.saveMessage(message);
         changed.push(message);
 
@@ -267,24 +279,6 @@ export class Hub {
     this.emit({ type: 'conversation.deleted', conversationId });
   }
 
-  async sendText(conversationId: string, text: string): Promise<Message> {
-    const conversation = this.requireConversation(conversationId);
-    const trimmed = text.trim();
-    if (!trimmed) throw new HubError('Message is empty');
-    const connector = this.connectors.get(conversation.sourceId);
-    if (conversation.sourceKind !== 'live' || !connector?.sendText) {
-      throw new HubError('This conversation is a read-only import', 409);
-    }
-    if (this.statuses.get(connector.id)?.state !== 'connected') {
-      throw new HubError(`${connector.label} is not connected`, 503);
-    }
-    const sent = await connector.sendText(conversation.nativeId, trimmed);
-    this.upsertMessages(connector.id, 'live', [sent], { countUnread: false });
-    const stored = this.store.getMessage(`${conversationId}:${sent.nativeId}`);
-    if (!stored) throw new Error('Sent message was not stored');
-    return stored;
-  }
-
   // ── Reads ─────────────────────────────────────────────────────────────────
 
   requireConversation(id: string): Conversation {
@@ -310,7 +304,7 @@ export class Hub {
         participants: input.participants ?? [],
         lastMessageAt: null,
         lastMessagePreview: null,
-        unreadCount: 0,
+        unreadCount: input.unreadCount ?? 0,
         messageCount: 0,
       };
     }
@@ -319,6 +313,7 @@ export class Hub {
       title: input.title || existing.title,
       isGroup: input.isGroup ?? existing.isGroup,
       participants: mergeParticipants(existing.participants, input.participants ?? []),
+      unreadCount: input.unreadCount ?? existing.unreadCount,
     };
   }
 
@@ -373,7 +368,8 @@ function mergeMessage(existing: Message, input: MessageInput): Message {
     ...existing,
     senderName: input.senderName || existing.senderName,
     kind: existing.deleted ? existing.kind : input.kind,
-    text: existing.deleted || existing.edited ? existing.text : input.text,
+    // An edited input carries the current text; otherwise don't let a stale copy undo an edit.
+    text: existing.deleted ? existing.text : input.edited || !existing.edited ? input.text : existing.text,
     attachments: existing.deleted ? [] : mergeAttachments(existing.attachments, input.attachments ?? []),
     reactions: input.reactions?.length ? input.reactions : existing.reactions,
     replyToNativeId: input.replyToNativeId ?? existing.replyToNativeId,
@@ -381,6 +377,10 @@ function mergeMessage(existing: Message, input: MessageInput): Message {
     edited: existing.edited || (input.edited ?? false),
     deleted: existing.deleted || (input.deleted ?? false),
   };
+}
+
+function sameMessage(a: Message, b: Message): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
 }
 
 function mergeAttachments(current: Attachment[], incoming: Attachment[]): Attachment[] {

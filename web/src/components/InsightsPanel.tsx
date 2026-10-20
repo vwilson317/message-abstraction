@@ -5,7 +5,8 @@ import { duration, fullDate, plural } from '../format';
 
 interface Props {
   conversation: Conversation;
-  onClose: () => void;
+  /** Omit when embedded in a view that has its own header. */
+  onClose?: () => void;
   onError: (message: string) => void;
   onDeleted: () => void;
 }
@@ -46,8 +47,15 @@ export function InsightsPanel({ conversation, onClose, onError, onDeleted }: Pro
 
   const hasSelf = conversation.participants.some((p) => p.isSelf);
   // Colour follows the person (their position in the participant list), never their rank.
+  // Colour follows the person, never their rank: you are always the first colour,
+  // everyone else keeps their place in the participant list.
+  const order = [
+    ...(stats?.participants.filter((p) => p.isSelf).map((p) => p.id) ?? []),
+    ...conversation.participants.filter((p) => !p.isSelf).map((p) => p.id),
+    ...(stats?.participants.filter((p) => !p.isSelf).map((p) => p.id) ?? []),
+  ].filter((id, i, all) => all.indexOf(id) === i);
   const slotOf = (id: string) => {
-    const i = conversation.participants.findIndex((p) => p.id === id);
+    const i = order.indexOf(id);
     return i >= 0 && i < SERIES_SLOTS ? i + 1 : null;
   };
 
@@ -73,13 +81,15 @@ export function InsightsPanel({ conversation, onClose, onError, onDeleted }: Pro
   };
 
   return (
-    <aside className="insights" aria-label="Insights">
-      <header className="insights-header">
-        <h2>Insights</h2>
-        <button className="icon-btn" onClick={onClose} aria-label="Close insights">
-          ×
-        </button>
-      </header>
+    <aside className={`insights ${onClose ? '' : 'insights-embedded'}`} aria-label="Insights">
+      {onClose && (
+        <header className="insights-header">
+          <h2>Insights</h2>
+          <button className="icon-btn" onClick={onClose} aria-label="Close insights">
+            ×
+          </button>
+        </header>
+      )}
 
       <div className="insights-body">
         {!hasSelf && conversation.participants.length > 1 && (

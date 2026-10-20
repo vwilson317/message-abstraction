@@ -3,6 +3,15 @@ import type { Conversation, Message } from '../core/types';
 /** A silence longer than this starts a new "session" of conversation. */
 export const SESSION_GAP_MS = 6 * 60 * 60 * 1000;
 
+/**
+ * Gaps shorter than this aren't real replies: they come from sources whose
+ * clocks are coarse (minute-precision exports, Instagram's occasional time
+ * dividers), where messages are spaced a millisecond apart to keep order.
+ */
+const MIN_REPLY_MS = 1000;
+/** Below this many real reply gaps, a median says more about noise than about a person. */
+const MIN_REPLY_SAMPLES = 3;
+
 export interface ParticipantStats {
   id: string;
   name: string;
@@ -31,7 +40,7 @@ export interface ConversationStats {
 }
 
 function median(values: number[]): number | null {
-  if (values.length === 0) return null;
+  if (values.length < MIN_REPLY_SAMPLES) return null;
   const sorted = [...values].sort((a, b) => a - b);
   const mid = Math.floor(sorted.length / 2);
   return sorted.length % 2 ? sorted[mid]! : (sorted[mid - 1]! + sorted[mid]!) / 2;
@@ -94,7 +103,7 @@ export function computeStats(conversation: Conversation, messages: Message[]): C
     if (gap > SESSION_GAP_MS) {
       sessions++;
       p.initiations++;
-    } else if (previous && previous.senderId !== m.senderId) {
+    } else if (previous && previous.senderId !== m.senderId && gap >= MIN_REPLY_MS) {
       p.replyTimes.push(gap);
     }
     previous = m;

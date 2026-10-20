@@ -2,7 +2,9 @@ import { serve } from '@hono/node-server';
 import { mkdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { loadConfig } from './config';
-import { WhatsAppConnector } from './connectors/whatsapp/connector';
+import { BrowserSource } from './connectors/browser/source';
+import { signatureOf } from './connectors/browser/align';
+import { WhatsAppMacConnector } from './connectors/whatsapp-mac/connector';
 import { Hub } from './core/hub';
 import { MediaStore } from './core/media';
 import { createApp } from './server/app';
@@ -20,10 +22,29 @@ const hub = new Hub(store, media, config.dataDir, (level, message, extra) => {
   else console.log(line);
 });
 
-hub.register(new WhatsAppConnector(config.whatsapp));
+if (config.whatsappMac.containerDir) {
+  hub.register(
+    new WhatsAppMacConnector({ containerDir: config.whatsappMac.containerDir, pollMs: config.whatsappMac.pollMs }),
+  );
+}
+
+hub.register(
+  new BrowserSource(
+    'instagram-web',
+    'instagram',
+    'Instagram (Chrome)',
+    'Open instagram.com/direct in Chrome with the Inbox extension installed.',
+    (conversationId, range) =>
+      (range
+        ? store.messagesBetween(conversationId, range.from, range.to, 5000)
+        : store.listMessages(conversationId, { limit: 500 }).messages
+      ).map((m) => ({ nativeId: m.nativeId, signature: signatureOf(m), timestamp: m.timestamp })),
+  ),
+);
 
 const app = createApp(hub, {
   allowedHosts: config.allowedHosts,
+  extensionIds: config.extensionIds,
   maxUploadBytes: config.maxUploadBytes,
   ...(process.env.NODE_ENV === 'production' && { staticDir: resolve('dist/web') }),
 });

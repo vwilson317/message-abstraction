@@ -32,7 +32,6 @@ export const api = {
   connectors: () => request<ConnectorStatus[]>('/api/connectors'),
   connect: (id: string) => request<void>(`/api/connectors/${enc(id)}/connect`, { method: 'POST' }),
   disconnect: (id: string) => request<void>(`/api/connectors/${enc(id)}/disconnect`, { method: 'POST' }),
-  logout: (id: string) => request<void>(`/api/connectors/${enc(id)}/logout`, { method: 'POST' }),
 
   conversations: () => request<Conversation[]>('/api/conversations'),
   setSelf: (id: string, selfParticipantId: string | null) =>
@@ -42,8 +41,6 @@ export const api = {
 
   messages: (id: string, before?: string) =>
     request<MessagePage>(`/api/conversations/${enc(id)}/messages?limit=60${before ? `&before=${enc(before)}` : ''}`),
-  send: (id: string, text: string) =>
-    request<Message>(`/api/conversations/${enc(id)}/messages`, json('POST', { text })),
 
   insights: (id: string) => request<ConversationStats>(`/api/conversations/${enc(id)}/insights`),
   transcript: (id: string, last?: number) =>

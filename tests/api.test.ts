@@ -5,7 +5,11 @@ import { makeHub } from './helpers';
 
 function setup() {
   const ctx = makeHub();
-  const app = createApp(ctx.hub, { allowedHosts: ['localhost', '127.0.0.1'], maxUploadBytes: 1024 * 1024 });
+  const app = createApp(ctx.hub, {
+    allowedHosts: ['localhost', '127.0.0.1'],
+    extensionIds: [],
+    maxUploadBytes: 1024 * 1024,
+  });
   const request = (path: string, init: RequestInit = {}) =>
     app.request(`http://localhost:4310${path}`, { ...init, headers: { host: 'localhost:4310', ...init.headers } });
   return { ...ctx, app, request };
@@ -43,18 +47,6 @@ describe('API', () => {
     expect(await transcript.text()).toContain('Vince: Yes! Send me the link');
   });
 
-  it('refuses to send into a read-only import', async () => {
-    const { request } = setup();
-    await importAndroid(request);
-    const res = await request(`/api/conversations/${encodeURIComponent('import:whatsapp:alice')}/messages`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ text: 'hi' }),
-    });
-    expect(res.status).toBe(409);
-    expect(await res.json()).toEqual({ error: 'This conversation is a read-only import' });
-  });
-
   it('lets you say which participant you are', async () => {
     const { request, hub } = setup();
     await importAndroid(request);
@@ -85,8 +77,8 @@ describe('API', () => {
       headers: { origin: 'https://evil.example', 'sec-fetch-site': 'cross-site' },
     });
     expect(crossSite.status).toBe(403);
-    const plain = await request(`/api/conversations/x/messages`, {
-      method: 'POST',
+    const plain = await request(`/api/conversations/x`, {
+      method: 'PATCH',
       headers: { 'content-type': 'text/plain' },
       body: JSON.stringify({ text: 'hi' }),
     });

@@ -79,23 +79,16 @@ export interface Message {
   deleted: boolean;
 }
 
-export type ConnectorState = 'stopped' | 'starting' | 'awaiting_auth' | 'connected' | 'reconnecting' | 'error';
-
-export interface ConnectorCapabilities {
-  send: boolean;
-  liveUpdates: boolean;
-}
+/** `needs_setup`: the app isn't installed, a permission is missing, or the extension isn't talking to us. */
+export type ConnectorState = 'stopped' | 'starting' | 'needs_setup' | 'connected' | 'error';
 
 export interface ConnectorStatus {
   id: string;
   platform: Platform;
   label: string;
   state: ConnectorState;
-  capabilities: ConnectorCapabilities;
-  /** Human-readable detail: an error message, sync progress, the linked account. */
+  /** Human-readable detail: what it's watching, what setup is missing, an error. */
   detail?: string;
-  /** A pairing QR code as a data: URL, while `state` is `awaiting_auth`. */
-  qr?: string;
 }
 
 export interface MessagePage {

@@ -17,8 +17,7 @@ interface Props {
   loaded: boolean;
   selectedId: string | null;
   onSelect: (id: string) => void;
-  onOpenAccounts: () => void;
-  onOpenImport: () => void;
+  onOpenSources: () => void;
 }
 
 export function Sidebar(props: Props) {
@@ -37,19 +36,28 @@ export function Sidebar(props: Props) {
   const unread = (platform: Filter) =>
     props.conversations.filter((c) => (platform === 'all' || c.platform === platform) && c.unreadCount > 0).length;
 
-  const attention = props.connectors.some((c) => c.state === 'awaiting_auth' || c.state === 'error');
+  // Idle sources (Instagram not open right now) are normal; only errors need attention.
+  const attention = props.connectors.some((c) => c.state === 'error');
 
   return (
     <aside className="sidebar">
       <header className="sidebar-header">
         <h1 className="brand">Inbox</h1>
         <div className="sidebar-actions">
-          <button className="btn btn-quiet" onClick={props.onOpenImport} title="Import a chat export">
-            Import
+          <button
+            className="btn btn-quiet"
+            title="Open a narrow panel to keep beside WhatsApp Desktop"
+            onClick={() => window.open('/?view=companion', 'inbox-companion', 'popup,width=420,height=780')}
+          >
+            Companion
           </button>
-          <button className="btn btn-quiet accounts-btn" onClick={props.onOpenAccounts} title="Connected accounts">
+          <button
+            className="btn btn-quiet accounts-btn"
+            onClick={props.onOpenSources}
+            title="Where conversations come from"
+          >
             <ConnectorDots connectors={props.connectors} />
-            Accounts
+            Sources
             {attention && <span className="dot-alert" aria-label="Needs attention" />}
           </button>
         </div>

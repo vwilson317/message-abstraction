@@ -1,120 +1,151 @@
 # message-abstraction
 
-One inbox over WhatsApp and Instagram DMs, with room for conversation insights
-next to the chat, so you don't have to export transcripts and read them somewhere else.
+Conversation insights beside the messaging apps you already use: **WhatsApp Desktop on
+your Mac** and **Instagram in Chrome**. No APIs and no second client. Inbox reads what
+those apps already have on your computer and shows it in a panel next to them. You keep
+chatting in the apps.
 
-- **WhatsApp, live.** Link it like WhatsApp Web (scan a QR code). Read, reply, and see
-  history sync in.
-- **WhatsApp and Instagram, imported.** Drop in a chat export (`.txt`/`.zip` from
-  WhatsApp, the JSON "Download your information" export from Instagram) and read it
-  in the same interface.
-- **Insights panel.** Who talks more, who reaches out first, reply times, when you talk,
-  how it changes month to month. Plus a one-click, LLM-ready transcript for any range.
-  This panel is where the AI assistant will plug in.
+- **WhatsApp Desktop (Mac):** reads the app's own local database, read-only, while it
+  runs. New messages, edits and deletes show up within a couple of seconds.
+- **Instagram (Chrome):** a small extension reads the conversation you have open, straight
+  from the page, and puts a side panel next to it.
+- **Insights:** who talks more, who reaches out first, reply times, when you talk, how it
+  changes month to month. Plus a one-click, LLM-ready transcript of any range. This panel
+  is where the AI assistant will plug in.
+- **Imports:** WhatsApp chat exports and Instagram data downloads, for history the apps
+  don't hold.
 
-Everything runs and stays on your machine: one Node process, one SQLite file.
+Everything stays on your machine: one Node process, one SQLite file, one unpacked
+extension.
 
-> **Status:** first cut. Instagram is import-only for now (see
-> [the trade-offs](docs/ARCHITECTURE.md#platform-access)), and the LLM layer is the
-> next step. Live WhatsApp uses an unofficial client; read [the caveat](#a-note-on-whatsapp).
+> **Status:** first cut of the app-overlay approach. The LLM layer is next. See
+> [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how each app is read and why.
 
 ## Quick start
 
-Requires Node.js 22.13 or newer.
+On the Mac where WhatsApp Desktop is installed and signed in, with Node.js 22.16 or newer:
 
 ```bash
 npm install
-npm run dev          # API on :4310, web UI on http://localhost:5173
-```
-
-Or as a single server:
-
-```bash
-npm run build
+npm run build        # builds the web app and the Chrome extension
 npm start            # http://localhost:4310
 ```
 
-### Connect WhatsApp
+### WhatsApp Desktop
 
-Open **Accounts → WhatsApp → Connect**, then on your phone go to
-**Settings → Linked devices → Link a device** and scan the code. Recent history syncs
-in over the next minute or two. The session is saved in `data/connectors/whatsapp/auth`,
-so restarts reconnect on their own. **Unlink** removes it from your phone and deletes
-the credentials.
+Starting the server begins reading WhatsApp Desktop's data. The first time, macOS asks
+whether your terminal may **access data from other apps**. Click **Allow**.
+
+That permission lasts only as long as that process runs. To stop the prompt for good,
+give the app you start the server from (Terminal, iTerm, …) **Full Disk Access** in
+System Settings → Privacy & Security, then restart it. The Sources dialog has a button
+that opens the right pane.
+
+Then click **Companion** in the sidebar. It opens a narrow window to keep beside WhatsApp:
+
+- **Follow** switches the companion to whichever chat you send a message in.
+- **Float** keeps it above other apps. This uses Chrome's Picture-in-Picture for pages,
+  so there's nothing to install.
+
+### Instagram
+
+1. Open `chrome://extensions`, turn on **Developer mode**, click **Load unpacked** and
+   choose `dist/extension`.
+2. Open a conversation at `instagram.com/direct`.
+3. Click the Inbox icon in Chrome's toolbar to open the side panel next to the chat.
+
+Instagram only shows about 20 messages at a time. Scroll up in the conversation to bring
+older ones in, or use **Read earlier messages** in the panel. That button scrolls the
+conversation for you, slowly; it's the one time the extension touches the page, and only
+when you click it.
 
 ### Import exports
 
-Use **Import** in the sidebar, or the CLI for big files and folders:
+Use **Sources → Import**, or the CLI for big files and folders:
 
 ```bash
 npm run import -- "WhatsApp Chat with Alice.zip"
 npm run import -- ~/Downloads/instagram-yourname-2026-10-01.zip
-npm run import -- ~/Downloads/instagram-export/          # an extracted folder works too
 npm run import -- chat.txt --self "Your Name" --date-order MDY
 ```
 
-- **WhatsApp:** open the chat → Export chat. "Attach media" brings the photos along.
-  iOS and Android formats, 12/24-hour clocks and day/month order are detected.
-- **Instagram:** Settings → Accounts Center → Your information and permissions →
-  Download your information → Messages, format **JSON**.
-
-Re-importing a newer export of the same chat merges into it instead of duplicating.
-If the importer can't tell which participant is you, the insights panel asks.
+- **WhatsApp:** open the chat on your phone → Export chat. "Attach media" brings the
+  photos along.
+- **Instagram:** Accounts Center → Your information and permissions → Download your
+  information → Messages, format **JSON**.
 
 ## Configuration
 
-All optional; see [`.env.example`](.env.example).
+All optional. Put them in `.env` or your shell; see [`.env.example`](.env.example).
 
-| Variable                     | Default              | What it does                                                   |
-| ---------------------------- | -------------------- | -------------------------------------------------------------- |
-| `PORT` / `HOST`              | `4310` / `127.0.0.1` | Where the API listens                                          |
-| `ALLOWED_HOSTS`              | —                    | Extra host names to answer to (e.g. a Tailscale name)          |
-| `DATA_DIR`                   | `./data`             | Database, media and credentials                                |
-| `MAX_UPLOAD_MB`              | `512`                | Upload limit for the web importer                              |
-| `WHATSAPP_SYNC_FULL_HISTORY` | `true`               | Ask the phone for full history when linking                    |
-| `WHATSAPP_AUTO_DOWNLOAD_MB`  | `16`                 | Auto-download live images, stickers and voice notes up to this |
-| `WHATSAPP_LOG_LEVEL`         | `silent`             | Baileys logging, for troubleshooting                           |
+| Variable             | Default                    | What it does                                                          |
+| -------------------- | -------------------------- | --------------------------------------------------------------------- |
+| `PORT` / `HOST`      | `4310` / `127.0.0.1`       | Where the server listens                                              |
+| `ALLOWED_HOSTS`      | none                       | Extra host names to answer to                                         |
+| `DATA_DIR`           | `./data`                   | Inbox's own database and imported media                               |
+| `MAX_UPLOAD_MB`      | `512`                      | Upload limit for the web importer                                     |
+| `WHATSAPP_CONTAINER` | WhatsApp's group container | Where to find WhatsApp Desktop's data (set this to try it off a Mac)  |
+| `WHATSAPP_POLL_MS`   | `1500`                     | How often to check WhatsApp's database for changes                    |
+| `EXTENSION_ID`       | any                        | Only accept captures from this extension id (see chrome://extensions) |
 
-## Privacy and security
+## Privacy and what it touches
 
-This server can read and send your messages, so:
+- **No network calls to WhatsApp or Instagram,** and nothing is ever sent. Inbox reads
+  your own data on your own computer.
+- **WhatsApp:** the database is opened read-only, with short reads so WhatsApp's own
+  writes are never held up. Like any SQLite reader, it records read marks in WhatsApp's
+  `-shm` file; it never writes to the database itself. Crypto material (`Axolotl.sqlite`
+  and the like) is never opened.
+- **Instagram:** the extension reads the page's visible text and image addresses. It
+  makes no requests of its own and doesn't change Instagram's page. Captures go from the
+  extension's background worker to `localhost`, never from instagram.com.
+- **The server** listens on `127.0.0.1` only. It refuses unexpected `Host` headers (DNS
+  rebinding) and cross-site writes (CSRF). The extension's origin is accepted only on the
+  two capture routes. Only the app itself and the extension may frame its pages. There is
+  no login, so don't expose it to a network.
+- `data/` holds your messages: treat it like a password.
 
-- It listens on `127.0.0.1` only, and refuses requests with unexpected `Host` headers
-  (DNS rebinding) or cross-site origins (CSRF). There is no login, so don't expose it
-  to a network without putting authentication in front.
-- `data/` holds your messages, media and WhatsApp session keys. It is git-ignored;
-  treat it like a password.
-- Media is served sandboxed (`Content-Security-Policy: sandbox`, `nosniff`).
+**Terms of service.** WhatsApp and Instagram don't offer this kind of access, and
+Instagram's terms forbid collecting information "in an automated way". Passive reading of
+your own screen is the low end of that. **Read earlier messages** automates scrolling, so
+it's opt-in.
 
-## A note on WhatsApp
+## Limits worth knowing
 
-WhatsApp's official API only works for business numbers, so personal accounts are
-linked through [Baileys](https://github.com/WhiskeySockets/Baileys), an open-source
-WhatsApp Web client. WhatsApp's terms don't allow unofficial clients. For ordinary
-personal use bans are rare, but they do happen, mostly to accounts that send in bulk.
-The app never sends anything you didn't type. Reading a chat here does not send read
-receipts.
+- **WhatsApp Desktop holds what WhatsApp synced to the Mac,** which may not be your whole
+  history. Most media is never downloaded. For older history, import an export from your
+  phone.
+- **WhatsApp's database layout is private** and can change with an update. Inbox checks
+  for the columns it needs and refuses to read a layout it doesn't recognise, rather
+  than misreading it.
+- **Instagram's page is read by structure and position:**
+  - Your own messages are the ones on the right. That assumes a left-to-right UI language.
+  - Times come only from Instagram's occasional date dividers, in English. Between
+    dividers, message order is exact but times are approximate, so reply-time stats skip
+    them.
+  - View-once messages can't be seen on the web at all.
 
 ## Development
 
 ```bash
+npm run dev          # API on :4310, web UI with hot reload on :5173
 npm test             # vitest
-npm run typecheck    # tsc
+npm run typecheck    # server, web and extension
 npm run format       # prettier
 ```
 
 ```
 src/
-  core/          domain types, connector contract, the hub, media store
-  connectors/    live services (whatsapp/ via Baileys)
-  importers/     export parsers (WhatsApp .txt, Instagram JSON) and the import pipeline
-  insights/      conversation stats and LLM-ready transcripts
-  store/         SQLite persistence (node:sqlite, no native deps)
-  server/        HTTP API + server-sent events (Hono)
-  cli/           npm run import
-web/src/         React client
-tests/           unit and API tests with hand-written export fixtures
+  core/                 domain types, source contract, the hub, media store
+  connectors/
+    whatsapp-mac/       WhatsApp Desktop's ChatStorage.sqlite reader
+    browser/            receives extension captures; aligns on-screen slices into history
+  importers/            export parsers (WhatsApp .txt, Instagram JSON)
+  insights/             conversation stats and LLM-ready transcripts
+  store/                SQLite persistence (node:sqlite, no native deps)
+  server/               HTTP API + server-sent events (Hono)
+  cli/                  npm run import
+extension/              Chrome MV3 extension: Instagram reader, side panel
+web/src/                React app: inbox, companion view
+tests/                  unit, DOM and API tests with hand-built fixtures
 ```
-
-How it fits together, the options for each platform, and the plan for the LLM layer:
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).

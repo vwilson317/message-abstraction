@@ -176,6 +176,19 @@ export class Store {
       .map(toMessage);
   }
 
+  /** Messages in a time window, oldest first, capped at `limit` (keeping the newest). */
+  messagesBetween(conversationId: string, from: number, to: number, limit: number): Message[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM (SELECT rowid AS _rowid, * FROM messages
+           WHERE conversation_id = ? AND timestamp BETWEEN ? AND ?
+           ORDER BY timestamp DESC, rowid DESC LIMIT ?)
+         ORDER BY timestamp, _rowid`,
+      )
+      .all(conversationId, from, to, limit)
+      .map(toMessage);
+  }
+
   latestMessage(conversationId: string): Message | undefined {
     const row = this.db
       .prepare('SELECT * FROM messages WHERE conversation_id = ? ORDER BY timestamp DESC, rowid DESC LIMIT 1')

@@ -1,6 +1,5 @@
 import type {
   Attachment,
-  ConnectorCapabilities,
   ConnectorStatus,
   DeliveryStatus,
   MessageKind,
@@ -15,6 +14,8 @@ export interface ConversationInput {
   nativeId: string;
   /** Omit to keep the current title (or fall back to the native id for new conversations). */
   title?: string;
+  /** The app's own unread count, for sources that can read it. Omit to let the hub count. */
+  unreadCount?: number;
   isGroup?: boolean;
   /** Merged into the known participants by id. */
   participants?: Participant[];
@@ -65,7 +66,7 @@ export interface ConnectorContext {
   upsertConversation(input: ConversationInput): void;
   upsertMessages(inputs: MessageInput[], options: UpsertOptions): void;
   patchMessage(patch: MessagePatch): void;
-  setStatus(status: Omit<ConnectorStatus, 'id' | 'platform' | 'label' | 'capabilities'>): void;
+  setStatus(status: Omit<ConnectorStatus, 'id' | 'platform' | 'label'>): void;
   /** Store media bytes and get back a URL the web client can load. */
   saveMedia(data: Uint8Array, hint: { fileName?: string; mimeType?: string }): string;
   /** Directory the connector may use for credentials and caches. */
@@ -74,21 +75,23 @@ export interface ConnectorContext {
 }
 
 /**
- * A live link to a messaging service. Implementations normalise the service's
- * events into ConversationInput/MessageInput and push them through the context.
+ * Mirrors a messaging app that is already running on this machine. It reads
+ * what the app shows or stores; it never talks to the service itself and
+ * never sends. Implementations normalise what they read into
+ * ConversationInput/MessageInput and push it through the context.
  */
 export interface Connector {
   readonly id: string;
   readonly platform: Platform;
   readonly label: string;
-  readonly capabilities: ConnectorCapabilities;
-  /** True when saved credentials exist in `dataDir`, so the hub can reconnect at boot. */
-  hasSession(dataDir: string): Promise<boolean>;
+  /** Whether to start watching at boot, e.g. because the app's data is present. */
+  shouldAutoStart(dataDir: string): Promise<boolean>;
   start(ctx: ConnectorContext): Promise<void>;
-  /** Close the connection but keep credentials. */
   stop(): Promise<void>;
-  /** Unlink this device and delete stored credentials. */
-  logout(): Promise<void>;
-  /** Send a text message and return it as it should be stored. */
-  sendText?(conversationNativeId: string, text: string): Promise<MessageInput>;
+  /** Absolute path of a media file the app stores locally, for an attachment URL this connector issued. */
+  mediaFile?(ref: string): string | null;
+  /** For sources the browser extension pushes into: accept one capture (untrusted JSON). */
+  receive?(body: unknown): { conversationId: string; added: number };
+  /** For push sources: the extension is alive and a matching tab is open. */
+  heartbeat?(): void;
 }

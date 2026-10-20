@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { api, type Conversation, type ConnectorStatus, type Message } from '../api';
 import { subscribe } from '../events';
 import { dayLabel, plural, sameDay } from '../format';
@@ -8,10 +8,9 @@ import { MessageBubble } from './MessageBubble';
 interface Props {
   conversation: Conversation;
   connector: ConnectorStatus | undefined;
-  insightsOpen: boolean;
-  onToggleInsights: () => void;
-  onBack: () => void;
-  onOpenAccounts: () => void;
+  /** Without these the thread renders headerless, for the companion view. */
+  header?: { insightsOpen: boolean; onToggleInsights: () => void; onBack: () => void };
+  onOpenSources: () => void;
   onError: (message: string) => void;
 }
 
@@ -69,19 +68,15 @@ function useMessages(conversationId: string, onError: (message: string) => void)
     }
   }, [conversationId, cursor, onError]);
 
-  const add = useCallback((message: Message) => setMessages((list) => insertSorted(list, message)), []);
-
-  return { messages, loading, hasOlder: cursor !== null, loadOlder, add };
+  return { messages, loading, hasOlder: cursor !== null, loadOlder };
 }
 
 export function Thread(props: Props) {
   const { conversation, connector, onError } = props;
-  const { messages, loading, hasOlder, loadOlder, add } = useMessages(conversation.id, onError);
+  const { messages, loading, hasOlder, loadOlder } = useMessages(conversation.id, onError);
   const scroller = useRef<HTMLDivElement>(null);
   const anchor = useRef<{ height: number; top: number } | null>(null);
   const stickToBottom = useRef(true);
-  const [draft, setDraft] = useState('');
-  const [sending, setSending] = useState(false);
 
   // Keep the view pinned: to the bottom for new messages, in place when older ones load above.
   useLayoutEffect(() => {
@@ -129,36 +124,23 @@ export function Thread(props: Props) {
     }
   }, [conversation.id, conversation.unreadCount]);
 
-  const readOnlyReason =
+  const days = useMemo(() => {
+    const groups: { key: string; messages: Message[] }[] = [];
+    for (const m of messages) {
+      const last = groups.at(-1);
+      if (last && sameDay(last.messages[0]!.timestamp, m.timestamp)) last.messages.push(m);
+      else groups.push({ key: m.id, messages: [m] });
+    }
+    return groups;
+  }, [messages]);
+
+  const appName = conversation.platform === 'whatsapp' ? 'WhatsApp' : 'Instagram';
+  const footerNote =
     conversation.sourceKind === 'import'
       ? 'Imported conversation — read only'
-      : !connector
-        ? 'This account is not configured'
-        : connector.state !== 'connected'
-          ? `${connector.label} is ${connector.state === 'reconnecting' ? 'reconnecting…' : 'not connected'}`
-          : null;
-
-  const send = async () => {
-    const text = draft.trim();
-    if (!text || readOnlyReason || sending) return;
-    setSending(true);
-    try {
-      stickToBottom.current = true;
-      add(await api.send(conversation.id, text));
-      setDraft('');
-    } catch (err) {
-      onError(`Not sent: ${(err as Error).message}`);
-    } finally {
-      setSending(false);
-    }
-  };
-
-  const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
-      e.preventDefault();
-      void send();
-    }
-  };
+      : connector?.state === 'connected'
+        ? `Mirrored from ${connector.label} — reply there`
+        : `${connector?.label ?? appName} isn't being watched right now`;
 
   const subtitle = [
     conversation.platform === 'whatsapp' ? 'WhatsApp' : 'Instagram',
@@ -170,83 +152,65 @@ export function Thread(props: Props) {
 
   return (
     <main className="thread">
-      <header className="thread-header">
-        <button className="icon-btn back-btn" onClick={props.onBack} aria-label="Back to conversations">
-          ‹
-        </button>
-        <Avatar name={conversation.title} platform={conversation.platform} size={38} />
-        <div className="thread-heading">
-          <h2>{conversation.title}</h2>
-          <p>{subtitle}</p>
-        </div>
-        <button
-          className={`btn btn-quiet ${props.insightsOpen ? 'active' : ''}`}
-          onClick={props.onToggleInsights}
-          aria-pressed={props.insightsOpen}
-        >
-          Insights
-        </button>
-      </header>
+      {props.header && (
+        <header className="thread-header">
+          <button className="icon-btn back-btn" onClick={props.header.onBack} aria-label="Back to conversations">
+            ‹
+          </button>
+          <Avatar name={conversation.title} platform={conversation.platform} size={38} />
+          <div className="thread-heading">
+            <h2>{conversation.title}</h2>
+            <p>{subtitle}</p>
+          </div>
+          <button
+            className={`btn btn-quiet ${props.header.insightsOpen ? 'active' : ''}`}
+            onClick={props.header.onToggleInsights}
+            aria-pressed={props.header.insightsOpen}
+          >
+            Insights
+          </button>
+        </header>
+      )}
 
       <div className="messages" ref={scroller} onScroll={onScroll}>
         {!loading && hasOlder && <div className="load-more">Loading earlier messages…</div>}
         {!loading && !hasOlder && messages.length > 0 && <div className="load-more">Beginning of conversation</div>}
         {!loading && messages.length === 0 && <div className="load-more">No messages yet</div>}
-        {messages.map((m, i) => {
-          const prev = messages[i - 1];
-          const newDay = !prev || !sameDay(prev.timestamp, m.timestamp);
-          const grouped =
-            !newDay &&
-            prev &&
-            prev.senderId === m.senderId &&
-            prev.kind !== 'system' &&
-            m.timestamp - prev.timestamp < 5 * 60_000;
-          return (
-            <Fragment key={m.id}>
-              {newDay && (
-                <div className="day-separator">
-                  <span>{dayLabel(m.timestamp)}</span>
-                </div>
-              )}
-              <MessageBubble
-                message={m}
-                showSender={conversation.isGroup && !m.fromSelf && !grouped}
-                grouped={!!grouped}
-              />
-            </Fragment>
-          );
-        })}
+        {days.map((day) => (
+          // One section per day, so each day's sticky header gives way to the next.
+          <section key={day.key} className="day">
+            <div className="day-separator">
+              <span>{dayLabel(day.messages[0]!.timestamp)}</span>
+            </div>
+            {day.messages.map((m, i) => {
+              const prev = day.messages[i - 1];
+              const grouped =
+                !!prev &&
+                prev.senderId === m.senderId &&
+                prev.kind !== 'system' &&
+                m.timestamp - prev.timestamp < 5 * 60_000;
+              return (
+                <MessageBubble
+                  key={m.id}
+                  message={m}
+                  showSender={conversation.isGroup && !m.fromSelf && !grouped}
+                  grouped={grouped}
+                />
+              );
+            })}
+          </section>
+        ))}
       </div>
 
       <footer className="composer">
-        {readOnlyReason ? (
-          <div className="composer-disabled">
-            {readOnlyReason}
-            {conversation.sourceKind === 'live' && (
-              <button className="btn btn-quiet" onClick={props.onOpenAccounts}>
-                Accounts
-              </button>
-            )}
-          </div>
-        ) : (
-          <>
-            <textarea
-              value={draft}
-              onChange={(e) => setDraft(e.target.value)}
-              onKeyDown={onKeyDown}
-              placeholder={`Message ${conversation.title}`}
-              rows={Math.min(6, Math.max(1, draft.split('\n').length))}
-              aria-label="Message"
-            />
-            <button
-              className="btn btn-primary send-btn"
-              onClick={() => void send()}
-              disabled={!draft.trim() || sending}
-            >
-              Send
+        <div className="composer-disabled">
+          {footerNote}
+          {conversation.sourceKind === 'live' && connector?.state !== 'connected' && (
+            <button className="btn btn-quiet" onClick={props.onOpenSources}>
+              Sources
             </button>
-          </>
-        )}
+          )}
+        </div>
       </footer>
     </main>
   );

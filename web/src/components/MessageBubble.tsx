@@ -1,4 +1,4 @@
-import { Fragment, memo, type ReactNode } from 'react';
+import { Fragment, memo, useState, type ReactNode } from 'react';
 import type { Attachment, Message } from '../api';
 import { hueFor, timeOfDay } from '../format';
 
@@ -41,11 +41,20 @@ const ATTACHMENT_ICON: Record<Attachment['type'], string> = {
 };
 
 function AttachmentView({ attachment }: { attachment: Attachment }) {
-  const { type, url, name } = attachment;
+  const { type, name } = attachment;
+  // Links to Instagram's CDN expire; fall back to the chip when an image won't load.
+  const [broken, setBroken] = useState(false);
+  const url = broken ? undefined : attachment.url;
   if (url && (type === 'image' || type === 'sticker')) {
     return (
       <a href={url} target="_blank" rel="noopener noreferrer" className={`media media-${type}`}>
-        <img src={url} alt={name ?? ATTACHMENT_LABEL[type]} loading="lazy" />
+        <img
+          src={url}
+          alt={name ?? ATTACHMENT_LABEL[type]}
+          loading="lazy"
+          referrerPolicy="no-referrer"
+          onError={() => setBroken(true)}
+        />
       </a>
     );
   }

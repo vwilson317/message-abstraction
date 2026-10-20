@@ -303,8 +303,7 @@ a {
 .state-connected {
   background: var(--ok);
 }
-.state-awaiting_auth,
-.state-reconnecting,
+.state-needs_setup,
 .state-starting {
   background: var(--warn);
 }
@@ -1168,4 +1167,151 @@ a {
   .insights {
     width: 100vw;
   }
+}
+
+/* ── Companion (side panel / floating window) ───────────────────────────── */
+.companion {
+  display: flex;
+  flex-direction: column;
+  height: 100dvh;
+  min-width: 0;
+  background: var(--bg);
+}
+.pip-body {
+  margin: 0;
+  background: var(--bg);
+}
+.companion-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+.companion-picker {
+  flex: 1;
+  min-width: 0;
+  height: 34px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  font-weight: 600;
+  text-overflow: ellipsis;
+}
+.companion-picker:disabled {
+  opacity: 1;
+  border-color: transparent;
+  appearance: none;
+  padding: 0;
+}
+.companion-tabs {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+.companion-open {
+  margin-left: auto;
+  font-size: 12px;
+  text-decoration: none;
+}
+.companion-body {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+}
+.companion-body > .insights,
+.companion-body > .thread {
+  flex: 1;
+  border: 0;
+}
+.insights-embedded {
+  position: static !important;
+  width: auto !important;
+  box-shadow: none !important;
+}
+.companion-empty {
+  margin: auto;
+  padding: 24px;
+  max-width: 320px;
+  color: var(--text-3);
+  text-align: center;
+}
+.companion-floating {
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  color: var(--text-2);
+  text-align: center;
+}
+.companion-footer {
+  position: relative;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  padding: 6px 12px;
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-2);
+  font-size: 12.5px;
+}
+.companion-note {
+  color: var(--text-3);
+}
+.companion-diagnosis {
+  position: absolute;
+  right: 8px;
+  bottom: calc(100% + 6px);
+  left: 8px;
+  max-height: 50vh;
+  margin: 0;
+  overflow: auto;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.sources-intro {
+  margin: 0 0 4px;
+}
+.account-detail-block {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: 13px;
+}
+.account .btn + .hint,
+.account p .btn {
+  margin-top: 8px;
+}
+.setup-steps {
+  margin: 10px 0 0;
+  padding-left: 20px;
+  color: var(--text-2);
+  line-height: 1.8;
+}
+.setup-steps code,
+.account .hint code {
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: var(--surface-3);
+  font-size: 12px;
+}
+.import-mark {
+  background: var(--text-3);
+  font-size: 15px;
+}
+.day {
+  display: flow-root;
 }
