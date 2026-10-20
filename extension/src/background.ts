@@ -1,4 +1,4 @@
-import { conversationIdFor, getServer, SOURCE_ID, type ExtensionMessage } from './shared';
+import { conversationIdFor, getServer, SOURCE_ID, type CaptureResult, type ExtensionMessage } from './shared';
 
 /**
  * Relays what the content script reads to the local server. Requests go from
@@ -51,20 +51,22 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, sender, sendRes
       if (tabId === undefined) return false;
       void (async () => {
         await setTabThread(tabId, message.threadId);
+        let result: CaptureResult;
         try {
           const res = await post('captures', message.capture);
-          sendResponse({ ok: res.ok, status: res.status });
+          result = { ok: res.ok, status: res.status };
         } catch {
-          sendResponse({ ok: false, status: 0 });
+          result = { ok: false, status: 0 };
         }
+        sendResponse(result);
         await announceActiveThread();
       })();
       return true;
     case 'heartbeat':
       post('heartbeat').catch(() => {});
       return false;
-    case 'left-thread':
-      if (tabId !== undefined) void setTabThread(tabId, null).then(announceActiveThread);
+    case 'thread':
+      if (tabId !== undefined) void setTabThread(tabId, message.threadId).then(announceActiveThread);
       return false;
     case 'get-active-thread':
       void activeThread().then((threadId) => sendResponse(threadId ? conversationIdFor(threadId) : null));
@@ -76,3 +78,14 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, sender, sendRes
 
 chrome.tabs.onActivated.addListener(() => void announceActiveThread());
 chrome.tabs.onRemoved.addListener((tabId) => void setTabThread(tabId, null));
+// After a reload or a navigation (to another site, say), ask the page what it shows. No
+// answer means no Instagram page, so no thread; the page also announces itself on load.
+chrome.tabs.onUpdated.addListener((tabId, change) => {
+  if (change.status !== 'complete') return;
+  const ask: ExtensionMessage = { type: 'get-thread' };
+  chrome.tabs
+    .sendMessage(tabId, ask)
+    .then((threadId: unknown) => setTabThread(tabId, typeof threadId === 'string' ? threadId : null))
+    .catch(() => setTabThread(tabId, null))
+    .then(announceActiveThread, () => {});
+});

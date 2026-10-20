@@ -4,9 +4,10 @@
  * text leaves, image sources and geometry, never on class names. As of
  * October 2026 (verified against independent open-source readers):
  *
- * - The thread lives at /direct/t/<thread_fbid>/.
- * - Messages are `div[role="article"]` inside `div[role="group"]` rows, or
- *   `[role="presentation"]` bubbles on accounts with the other layout.
+ * - The thread lives at /direct/t/<thread id>/ (numeric so far).
+ * - Messages are `div[role="article"]` inside `div[role="group"]` (or
+ *   `div[role="row"]`) rows, or `[role="presentation"]` bubbles on accounts
+ *   with the other layout.
  * - Nothing marks your own messages; they hug the right edge of their row.
  * - Only about 20 bubbles are rendered at a time (the list is virtualised),
  *   so each read is a window. The server stitches windows together.
@@ -28,8 +29,11 @@ export interface DomMessage {
 }
 
 export interface DomCapture {
-  thread: { id: string; title: string; isGroup: boolean; participants?: string[] };
+  /** isGroup is left out when the page doesn't make it clear. */
+  thread: { id: string; title: string; isGroup?: boolean; participants?: string[] };
   messages: DomMessage[];
+  /** The window reaches the newest message, so anything new in it is recent. */
+  atBottom: boolean;
 }
 
 export interface Diagnosis {
@@ -50,11 +54,18 @@ export type RectOf = (el: Element) => { left: number; right: number; top: number
 const defaultRectOf: RectOf = (el) => el.getBoundingClientRect();
 
 export function threadIdFromPath(path: string): string | null {
-  return path.match(/^\/direct\/t\/(\d+)/)?.[1] ?? null;
+  const id = path.match(/^\/direct\/t\/([^/?#]+)/)?.[1];
+  // Ids the server wouldn't accept are ignored rather than sent.
+  return id && /^[\w.-]+$/.test(id) ? id : null;
 }
 
+/** A message's row: the full-width line it sits in. */
+const ROW = 'div[role="group"], div[role="row"]';
+
+/** Words Instagram's own controls and receipts show. People send some of them as messages too. */
 const UI_LABELS =
   /^(seen|seen by .+|seen just now|reply|like|more|delivered|sent|edited|unsend|forward|copy|react|active now|active \d+\s?\w* ago|typing…?)$/i;
+const CONTROL = 'button, [role="button"], [aria-label]';
 const PLACEHOLDER =
   /unsupported message|to view this message|use the (instagram |mobile )?app|only be (replayed|played|viewed) once/i;
 const ROUTES = new Set([
@@ -87,17 +98,26 @@ export function findScrollContainer(doc: Document): HTMLElement | null {
   return candidates.filter((c) => !candidates.some((other) => other !== c && c.contains(other))).at(-1) ?? null;
 }
 
-function leafTexts(unit: Element): string[] {
+/**
+ * The bubble's text. A label word inside a control is always UI. Otherwise
+ * it's a receipt ("Seen") when the bubble has other content, and the message
+ * itself when it doesn't: a friend can reply just "Like". Receipts follow the
+ * bubble, so the first label then is the message.
+ */
+function leafTexts(unit: Element, hasAttachments: boolean): string[] {
   const leaves = [...unit.querySelectorAll('[dir="auto"]')].filter(
     (el) => !el.querySelector('[dir="auto"]') && !el.closest('time'),
   );
   const texts: string[] = [];
+  const labels: string[] = [];
   for (const el of leaves) {
     const text = (el.textContent ?? '').replace(/\s+\n/g, '\n').trim();
-    if (!text || UI_LABELS.test(text) || texts.includes(text)) continue;
-    texts.push(text);
+    if (!text || texts.includes(text)) continue;
+    const control = el.closest(CONTROL);
+    if (!UI_LABELS.test(text)) texts.push(text);
+    else if (!control || control === unit || !unit.contains(control)) labels.push(text);
   }
-  return texts;
+  return texts.length || hasAttachments ? texts : labels.slice(0, 1);
 }
 
 function attachmentsOf(unit: Element, rectOf: RectOf): DomAttachment[] {
@@ -132,7 +152,7 @@ function attachmentsOf(unit: Element, rectOf: RectOf): DomAttachment[] {
  * (tests, odd states) fall back to flex alignment on the way up.
  */
 function isOutgoing(unit: Element, container: Element, rectOf: RectOf, view: Window): boolean {
-  const row = unit.closest('div[role="group"]') ?? container;
+  const row = unit.closest(ROW) ?? container;
   const r = rectOf(unit);
   const rr = rectOf(row);
   if (rr.width > 0 && r.width > 0) return Math.abs(r.right - rr.right) < Math.abs(r.left - rr.left);
@@ -144,11 +164,59 @@ function isOutgoing(unit: Element, container: Element, rectOf: RectOf, view: Win
   return false;
 }
 
-const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
-const WEEKDAYS = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
+const MONTH_NAMES = [
+  'jan(?:uary)?',
+  'feb(?:ruary)?',
+  'mar(?:ch)?',
+  'apr(?:il)?',
+  'may',
+  'june?',
+  'july?',
+  'aug(?:ust)?',
+  'sep(?:t(?:ember)?)?',
+  'oct(?:ober)?',
+  'nov(?:ember)?',
+  'dec(?:ember)?',
+];
+const WEEKDAY_NAMES = [
+  'sun(?:day)?',
+  'mon(?:day)?',
+  'tue(?:s(?:day)?)?',
+  'wed(?:nesday)?',
+  'thu(?:r(?:s(?:day)?)?)?',
+  'fri(?:day)?',
+  'sat(?:urday)?',
+];
+const MONTH = `(?:${MONTH_NAMES.join('|')})\\.?`;
+const WEEKDAY = `(?:${WEEKDAY_NAMES.join('|')})\\.?`;
+const CLOCK = String.raw`\d{1,2}[:.]\d{2}(?:\s*[ap]\.?m\.?)?`;
+const DAY = String.raw`\d{1,2}(?:st|nd|rd|th)?`;
+const YEAR = String.raw`(?:,?\s+\d{4})?`;
+/** An optional time after a date: "…, 9:15 AM", "… at 10:42". */
+const AT_TIME = String.raw`(?:,?\s*(?:at\s+)?${CLOCK})?`;
+
+/** A whole label that is a date and/or time, and nothing else, so message text never passes. */
+const DIVIDER_PATTERN = new RegExp(
+  [
+    String.raw`(?:today|yesterday)${AT_TIME}`,
+    String.raw`${WEEKDAY}${AT_TIME}`,
+    String.raw`(?:${WEEKDAY},?\s+)?${MONTH}\s+${DAY}${YEAR}${AT_TIME}`,
+    String.raw`(?:${WEEKDAY},?\s+)?${DAY}\s+${MONTH}${YEAR}${AT_TIME}`,
+    CLOCK,
+  ]
+    .map((alt) => `^${alt}$`)
+    .join('|'),
+  'i',
+);
+
+export function isDividerLabel(text: string): boolean {
+  return DIVIDER_PATTERN.test(text.trim().replace(/\s+/g, ' '));
+}
+
+const CLOCK_RE = /(\d{1,2})[:.](\d{2})\s*([ap]\.?m\.?)?/i;
 
 function clock(text: string): [number, number] | null {
-  const m = text.match(/(\d{1,2})[:.](\d{2})\s*([ap]\.?m\.?)?/i);
+  const m = text.match(CLOCK_RE);
   if (!m) return null;
   let hour = Number(m[1]);
   const minute = Number(m[2]);
@@ -158,39 +226,50 @@ function clock(text: string): [number, number] | null {
   return hour < 24 && minute < 60 ? [hour, minute] : null;
 }
 
+/** Labels can't be in the future; allow a little clock skew. */
+const FUTURE_SLACK_MS = 5 * 60 * 1000;
+
 /**
  * Turn an Instagram divider label into a time. English labels only; others
- * return null and the server fills in times from order.
+ * return null and the server fills in times from order. Never returns a time
+ * in the future: a year-less date that would be moves back a year (a
+ * December label read in January), and a "Today" or bare time moves back a
+ * day (a tab left open past midnight).
  */
 export function parseDividerTime(label: string, now: Date = new Date()): number | null {
-  const text = label.trim().toLowerCase();
+  const text = label.trim().toLowerCase().replace(/\s+/g, ' ');
   const time = clock(text) ?? [0, 0];
-  const at = (d: Date) => new Date(d.getFullYear(), d.getMonth(), d.getDate(), time[0], time[1]).getTime();
-  const day = (offset: number) => new Date(now.getFullYear(), now.getMonth(), now.getDate() + offset);
+  const at = (y: number, m: number, d: number) => new Date(y, m, d, time[0], time[1]).getTime();
+  const day = (offset: number) => at(now.getFullYear(), now.getMonth(), now.getDate() + offset);
+  const limit = now.getTime() + FUTURE_SLACK_MS;
+  const past = (ts: number, earlier: () => number) => (ts > limit ? earlier() : ts);
+  const checked = (ts: number | null) => (ts !== null && ts <= limit ? ts : null);
 
-  if (/^today\b/.test(text)) return at(day(0));
-  if (/^yesterday\b/.test(text)) return at(day(-1));
+  if (/^today\b/.test(text)) return checked(past(day(0), () => day(-1)));
+  if (/^yesterday\b/.test(text)) return checked(day(-1));
+  if (new RegExp(`^${CLOCK}$`, 'i').test(text)) return checked(past(day(0), () => day(-1)));
 
-  const weekday = WEEKDAYS.findIndex((w) => text.startsWith(w));
-  const month = MONTHS.findIndex((m) => new RegExp(`\\b${m}[a-z]*\\b`).test(text));
-  if (weekday >= 0 && month < 0) {
+  // Take the clock out first, so its hour is never read as the day of the month.
+  const date = text.replace(CLOCK_RE, ' ');
+  const monthMatch = new RegExp(`\\b(${MONTH_NAMES.join('|')})\\.?(?![a-z])`).exec(date);
+  const weekday = WEEKDAY_NAMES.findIndex((w) => new RegExp(`^${w}\\.?(?![a-z])`).test(date));
+  if (!monthMatch && weekday >= 0) {
     // Weekday labels cover the past week; today and yesterday have their own words.
     const back = (now.getDay() - weekday + 7) % 7 || 7;
-    return at(day(-back));
+    return checked(day(-back));
   }
-  if (month >= 0) {
-    const nums = [...text.matchAll(/\b(\d{1,4})\b/g)].map((m) => Number(m[1]));
-    const year = nums.find((n) => n >= 2000) ?? now.getFullYear();
-    const dayOfMonth = nums.find((n) => n >= 1 && n <= 31 && !(clock(text) && text.includes(`${n}:`)));
-    if (!dayOfMonth) return null;
-    return at(new Date(year, month, dayOfMonth));
-  }
-  if (/^\d{1,2}[:.]\d{2}/.test(text)) return at(day(0));
-  return null;
+  if (!monthMatch) return null;
+  const month = MONTH_NAMES.findIndex((m) => new RegExp(`^${m}$`).test(monthMatch[1]!));
+  // The day sits next to the month: "Oct 3" or "3 Oct".
+  const after = date.slice(monthMatch.index + monthMatch[0].length).match(/^\s*(\d{1,2})(?:st|nd|rd|th)?\b/);
+  const before = date.slice(0, monthMatch.index).match(/\b(\d{1,2})(?:st|nd|rd|th)?\s*$/);
+  const dayOfMonth = Number(after?.[1] ?? before?.[1] ?? 0);
+  if (dayOfMonth < 1 || dayOfMonth > 31) return null;
+  const year = date.match(/\b(\d{4})\b/);
+  if (year) return checked(at(Number(year[1]), month, dayOfMonth));
+  const y = now.getFullYear();
+  return checked(past(at(y, month, dayOfMonth), () => at(y - 1, month, dayOfMonth)));
 }
-
-const DIVIDER_PATTERN =
-  /^(today|yesterday|mon|tue|wed|thu|fri|sat|sun)\b|\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b.*\d|^\d{1,2}[:.]\d{2}(\s*[ap]\.?m\.?)?$/i;
 
 /** Your own username, which Instagram embeds in page JSON. */
 function ownHandle(doc: Document): string | null {
@@ -201,13 +280,69 @@ function ownHandle(doc: Document): string | null {
   return null;
 }
 
+function handleOf(a: Element, exclude: string | null): string | null {
+  const m = (a.getAttribute('href') ?? '').match(/^\/([A-Za-z0-9._]{1,30})\/?$/);
+  return m && !ROUTES.has(m[1]!) && m[1] !== exclude ? m[1]! : null;
+}
+
 function handlesIn(root: Element, exclude: string | null): string[] {
-  const handles: string[] = [];
-  for (const a of root.querySelectorAll('a[href]')) {
-    const m = (a.getAttribute('href') ?? '').match(/^\/([A-Za-z0-9._]{1,30})\/?$/);
-    if (m && !ROUTES.has(m[1]!) && m[1] !== exclude) handles.push(m[1]!);
+  return [...root.querySelectorAll('a[href]')].map((a) => handleOf(a, exclude)).filter((h): h is string => !!h);
+}
+
+function avatarName(img: Element): string | null {
+  return (img.getAttribute('alt') ?? '').match(/^(.+?)['’]s profile picture$/i)?.[1] ?? null;
+}
+
+/** A shared post or reel: its card shows the author's avatar and links, which say nothing about the thread. */
+const SHARED = 'a[href*="/p/"], a[href*="/reel/"]';
+
+/**
+ * The thread's own header: what sits before the message list in the thread
+ * pane. Climbs from the list, collecting earlier siblings, but never the
+ * inbox column (it links to other threads) and, with layout, only what's
+ * above the list.
+ */
+function headerOf(container: Element, main: Element, rectOf: RectOf): Element[] {
+  const list = rectOf(container);
+  const header: Element[] = [];
+  for (let node: Element = container; node !== main && node.parentElement; node = node.parentElement) {
+    for (let sib = node.previousElementSibling; sib; sib = sib.previousElementSibling) {
+      if (sib.querySelector('a[href*="/direct/t/"]')) continue;
+      const r = rectOf(sib);
+      if (list.width > 0 && r.width > 0 && (r.right <= list.left || r.left >= list.right)) continue;
+      header.push(sib);
+    }
   }
-  return handles;
+  return header;
+}
+
+/**
+ * Whether the page says this is a group. True on a member count or several
+ * people in the header, or several people writing in the window; false when
+ * the header (or the profile card at the top) names exactly one person;
+ * undefined when nothing on screen tells.
+ */
+function groupSignal(
+  header: Element[],
+  container: Element,
+  own: string | null,
+  speakers: Set<string>,
+): boolean | undefined {
+  const texts = header.flatMap((el) => [el, ...el.querySelectorAll('*')]).filter((el) => el.children.length === 0);
+  if (texts.some((el) => /\b\d+\s+(members|people|participants)\b/i.test(el.textContent ?? ''))) return true;
+  const avatars = new Set(
+    header.flatMap((el) => [...el.querySelectorAll('img[alt]')].map(avatarName)).filter((n) => n && n !== own),
+  );
+  if (avatars.size > 1 || speakers.size > 1) return true;
+  const handles = new Set(header.flatMap((el) => handlesIn(el, own)));
+  const cards = new Set(
+    [...container.querySelectorAll('a[href]')]
+      .filter((a) => a.querySelector('[role="article"], [role="presentation"]'))
+      .map((a) => handleOf(a, own))
+      .filter(Boolean),
+  );
+  if (handles.size === 1 || (handles.size === 0 && cards.size === 1)) return false;
+  return undefined;
 }
 
 function threadTitle(doc: Document, container: Element, own: string | null): string {
@@ -224,15 +359,36 @@ function threadTitle(doc: Document, container: Element, own: string | null): str
   return [...counts].sort((a, b) => b[1] - a[1])[0]?.[0] ?? 'Instagram';
 }
 
-/** In groups, a run of messages shows the sender's avatar or profile link once. */
-function senderHint(unit: Element, own: string | null): string | null {
-  const row = unit.closest('div[role="group"]') ?? unit.parentElement;
+/**
+ * In groups, a run of messages shows the sender's avatar or profile link once,
+ * beside the bubble. Only that slot counts: avatars and links inside a
+ * message (a shared post's author, an @mention) or another bubble don't.
+ */
+function senderHint(unit: Element, own: string | null, units: Element[]): string | null {
+  const row = unit.closest(ROW) ?? unit.parentElement;
   if (!row) return null;
+  const beside = (el: Element) =>
+    !units.some((u) => u.contains(el)) && !el.closest(SHARED) && !el.closest('[dir="auto"]');
   for (const img of row.querySelectorAll('img[alt]')) {
-    const m = (img.getAttribute('alt') ?? '').match(/^(.+?)['’]s profile picture$/i);
-    if (m && m[1] !== own) return m[1]!;
+    const name = avatarName(img);
+    if (name && name !== own && beside(img)) return name;
   }
-  return handlesIn(row, own)[0] ?? null;
+  for (const a of row.querySelectorAll('a[href]')) {
+    const handle = beside(a) ? handleOf(a, own) : null;
+    if (handle) return handle;
+  }
+  return null;
+}
+
+/** Scrolled all the way to the newest message (Instagram's list is usually column-reverse). */
+function atNewest(container: HTMLElement, view: Window): boolean {
+  const SLACK_PX = 4;
+  if (container.scrollTop < -SLACK_PX) return false; // only a reversed list scrolls negative
+  const reversed = [container, container.firstElementChild].some(
+    (el) => el && view.getComputedStyle(el).flexDirection === 'column-reverse',
+  );
+  if (reversed) return Math.abs(container.scrollTop) <= SLACK_PX;
+  return container.scrollHeight - container.clientHeight - container.scrollTop <= SLACK_PX;
 }
 
 function collect(doc: Document, rectOf: RectOf) {
@@ -251,7 +407,7 @@ function collect(doc: Document, rectOf: RectOf) {
 
   const dividers = [...container.querySelectorAll('[dir="auto"], span, div')].filter((el) => {
     if (el.children.length > 0 || units.some((u) => u.contains(el))) return false;
-    return DIVIDER_PATTERN.test((el.textContent ?? '').trim());
+    return isDividerLabel(el.textContent ?? '');
   });
 
   const tops = new Map<Element, number>();
@@ -288,12 +444,13 @@ export function readInstagramThread(
   const { container, items, view } = found;
   const own = ownHandle(doc);
   const title = threadTitle(doc, container, own);
+  const main = doc.querySelector('div[role="main"]') ?? doc.body;
 
-  // Avatars and profile links name senders in groups; one distinct name means a 1:1 thread.
-  const hints = new Map<Element, string | null>();
-  for (const item of items) if (item.kind === 'unit') hints.set(item.el, senderHint(item.el, own));
-  const distinct = new Set([...hints.values()].filter((h): h is string => !!h));
-  const isGroup = distinct.size > 1;
+  // Avatars and profile links beside bubbles name senders in groups.
+  const units = items.filter((i) => i.kind === 'unit').map((i) => i.el);
+  const hints = new Map(units.map((unit) => [unit, senderHint(unit, own, units)]));
+  const speakers = new Set([...hints.values()].filter((h): h is string => !!h));
+  const isGroup = groupSignal(headerOf(container, main, rectOf), container, own, speakers);
 
   const messages: DomMessage[] = [];
   let currentTime: number | undefined;
@@ -304,16 +461,16 @@ export function readInstagramThread(
       continue;
     }
     const unit = item.el;
-    const texts = leafTexts(unit);
     const attachments = attachmentsOf(unit, rectOf);
+    const texts = leafTexts(unit, attachments.length > 0);
     const placeholder = texts.some((t) => PLACEHOLDER.test(t));
     if (!texts.length && !attachments.length) continue;
     const fromSelf = isOutgoing(unit, container, rectOf, view);
     let senderName = '';
     if (!fromSelf) {
-      // In a 1:1 thread the other person is the thread. In groups, a run shows its
-      // sender once; unknown stays empty so the server keeps any name it learned before.
-      senderName = isGroup ? (hints.get(unit) ?? lastSender ?? '') : title;
+      // In a 1:1 thread the other person is the thread. Otherwise a run shows its sender
+      // once; unknown stays empty so the server keeps any name it learned before.
+      senderName = isGroup === false ? title : (hints.get(unit) ?? lastSender ?? '');
       lastSender = senderName || lastSender;
     } else lastSender = null;
     messages.push({
@@ -325,8 +482,14 @@ export function readInstagramThread(
     });
   }
   return {
-    thread: { id: threadId, title, isGroup, ...(isGroup && { participants: [...distinct] }) },
+    thread: {
+      id: threadId,
+      title,
+      ...(isGroup !== undefined && { isGroup }),
+      ...(isGroup && { participants: [...speakers] }),
+    },
     messages,
+    atBottom: atNewest(container, view),
   };
 }
 

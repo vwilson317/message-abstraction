@@ -139,11 +139,22 @@ the extension reads the **DOM**:
 - **Your messages:** they hug the right edge of their row. That's geometry, so it assumes
   a left-to-right UI language.
 - **Times:** only from the centred divider rows ("Today 10:42", "3 Oct 2026"), in English.
+  A divider must be a whole date label, so a message like "Maybe at 5?" isn't one, and
+  a parsed time is never in the future (a year-less date after New Year moves back a
+  year; a stale "Today" moves back a day).
+- **Group threads:** decided from the thread header ("N members", several avatars) and
+  the senders in view. When the page can't tell, the capture says nothing, and the
+  server keeps what it knew. Only the avatar beside a bubble names its sender, never one
+  inside a shared post or an @mention.
 - **The list:** it's a `column-reverse` scroller that renders about 20 bubbles at a time.
 
 The content script is passive by default: no requests, no clicks, no DOM edits. It sends
-a snapshot of the visible window to the service worker whenever the page settles. The
-worker posts it to the local server. Extension pages are exempt from Chrome's Local
+a snapshot of the visible window to the service worker whenever the page settles, along
+with whether the window reaches the newest message (`atBottom`). The worker posts it to
+the local server and reports back; a snapshot the server couldn't take (not running yet,
+busy) is sent again on the next change or heartbeat. The script also tells the worker
+which thread its tab shows, on load, on every in-page move and when the page goes away,
+so the side panel follows the tab. Extension pages are exempt from Chrome's Local
 Network Access prompts; content scripts are not, which is why the page never calls
 `localhost` itself.
 
@@ -172,7 +183,8 @@ page could only attribute to the thread's title keeps its stored sender.
 
 **Read earlier messages** is the one exception to passive reading, and only when you
 click it. It scrolls the thread back by ¾ of a screen, waits 1.5 s plus Instagram's
-loading skeleton, and stops at 40 steps or when nothing moves three times in a row.
+loading skeleton, and stops at 40 steps, when nothing moves three times in a row, when
+you switch to another conversation, or as soon as you scroll yourself.
 
 **Side panel.** A thin frame around the local app's companion view (`/?view=companion
 &embed=extension`), told by the extension which thread the active tab has open. It

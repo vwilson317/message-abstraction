@@ -1,4 +1,4 @@
-import type { ExtensionMessage } from '../shared';
+import type { CaptureResult, ExtensionMessage } from '../shared';
 import { diagnose, findScrollContainer, readInstagramThread, threadIdFromPath } from './instagram-dom';
 
 /**
@@ -14,36 +14,55 @@ import { diagnose, findScrollContainer, readInstagramThread, threadIdFromPath } 
 const SETTLE_MS = 700;
 const HEARTBEAT_MS = 30_000;
 
-let threadId: string | null = null;
+let threadId = threadIdFromPath(location.pathname);
+/** The last snapshot the server took, and the one on its way there. */
 let lastSent = '';
+let inFlight = '';
 let timer: ReturnType<typeof setTimeout> | undefined;
 let alive = true;
 
-function send(message: ExtensionMessage): void {
-  if (!alive) return;
+function send(message: ExtensionMessage): Promise<unknown> {
+  if (!alive) return Promise.resolve(undefined);
   try {
-    chrome.runtime.sendMessage(message).catch(() => {});
+    return chrome.runtime.sendMessage(message).catch(() => undefined);
   } catch {
     // The extension was reloaded or removed; this copy of the script is orphaned.
     alive = false;
     observer.disconnect();
+    return Promise.resolve(undefined);
   }
+}
+
+/** Tell the service worker which thread this tab shows, so the side panel can follow. */
+function announce(): void {
+  void send({ type: 'thread', threadId });
+}
+
+/** Worth sending again: the server wasn't reachable, was starting up, or was busy. */
+function retryable(result: CaptureResult | undefined): boolean {
+  if (!result) return true;
+  const { ok, status } = result;
+  return !ok && (status === 0 || status >= 500 || status === 408 || status === 429);
 }
 
 function capture(): void {
   const id = threadIdFromPath(location.pathname);
   if (id !== threadId) {
-    if (threadId && !id) send({ type: 'left-thread' });
     threadId = id;
     lastSent = '';
+    announce();
   }
   if (!id) return;
   const snapshot = readInstagramThread(document, id);
   if (!snapshot || snapshot.messages.length === 0) return;
   const serialized = JSON.stringify(snapshot);
-  if (serialized === lastSent) return;
-  lastSent = serialized;
-  send({ type: 'capture', capture: snapshot, threadId: id });
+  if (serialized === lastSent || serialized === inFlight) return;
+  inFlight = serialized;
+  void send({ type: 'capture', capture: snapshot, threadId: id }).then((result) => {
+    if (inFlight === serialized) inFlight = '';
+    // Only a snapshot the server took counts as sent; the rest go again on the next change or heartbeat.
+    if (!retryable(result as CaptureResult | undefined)) lastSent = serialized;
+  });
 }
 
 function schedule(): void {
@@ -54,12 +73,21 @@ function schedule(): void {
 // Instagram is a single-page app: navigation and new messages both show up as DOM changes.
 const observer = new MutationObserver(schedule);
 observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+announce();
 schedule();
 
 setInterval(() => {
-  if (location.pathname.startsWith('/direct')) send({ type: 'heartbeat' });
+  if (!location.pathname.startsWith('/direct')) return;
+  void send({ type: 'heartbeat' });
+  capture(); // resends a snapshot the server didn't take
 }, HEARTBEAT_MS);
-send({ type: 'heartbeat' });
+void send({ type: 'heartbeat' });
+
+// Leaving the page (reload, another site) ends this thread; coming back from the back/forward cache resumes it.
+addEventListener('pagehide', () => void send({ type: 'thread', threadId: null }));
+addEventListener('pageshow', (e) => {
+  if (e.persisted) announce();
+});
 
 // ── Reading history on request ─────────────────────────────────────────────
 
@@ -76,35 +104,63 @@ function loading(): boolean {
   return document.querySelector('[role="progressbar"][data-visualcompletion="loading-state"]') !== null;
 }
 
+let stopReason = 'Stopped';
+
 async function readHistory(maxSteps: number): Promise<void> {
   const run = ++historyRun;
+  stopReason = 'Stopped';
+  const thread = threadIdFromPath(location.pathname);
   const report = (steps: number, done: boolean, reason?: string) =>
-    send({ type: 'history-progress', steps, done, ...(reason && { reason }) });
-  let unchanged = 0;
-  for (let step = 1; step <= maxSteps; step++) {
-    const container = findScrollContainer(document);
-    if (run !== historyRun) return report(step - 1, true, 'Stopped');
-    if (!container || !threadIdFromPath(location.pathname)) return report(step - 1, true, 'No conversation open');
-    const heightBefore = container.scrollHeight;
-    const topBefore = container.scrollTop;
-    // The list is column-reverse: older messages are at more negative scrollTop.
-    container.scrollTop -= container.clientHeight * 0.75;
-    const moved = container.scrollTop !== topBefore;
-    await sleep(STEP_PAUSE_MS);
-    const deadline = performance.now() + LOAD_TIMEOUT_MS;
-    while (loading() && performance.now() < deadline) await sleep(250);
-    capture();
-    // At the top, nothing moves and nothing more loads.
-    unchanged = moved || container.scrollHeight !== heightBefore ? 0 : unchanged + 1;
-    report(step, false);
-    if (unchanged >= 3) return report(step, true, 'Reached the beginning');
+    void send({ type: 'history-progress', steps, done, ...(reason && { reason }) });
+  if (!thread) return report(0, true, 'No conversation open');
+  // Scrolling yourself takes over: the read stops rather than fight you.
+  const takeOver = (e: Event) => {
+    if (!e.isTrusted || run !== historyRun) return;
+    stopReason = 'Stopped because you scrolled';
+    historyRun++;
+  };
+  addEventListener('wheel', takeOver, { capture: true, passive: true });
+  addEventListener('touchmove', takeOver, { capture: true, passive: true });
+  /** Why to stop now, if anything changed under the read. */
+  const interrupted = () =>
+    run !== historyRun ? stopReason : threadIdFromPath(location.pathname) !== thread ? 'Conversation changed' : null;
+  try {
+    let unchanged = 0;
+    for (let step = 1; step <= maxSteps; step++) {
+      const before = interrupted();
+      if (before) return report(step - 1, true, before);
+      const container = findScrollContainer(document);
+      if (!container) return report(step - 1, true, 'No conversation open');
+      const heightBefore = container.scrollHeight;
+      const topBefore = container.scrollTop;
+      // The list is column-reverse: older messages are at more negative scrollTop.
+      container.scrollTop -= container.clientHeight * 0.75;
+      const moved = container.scrollTop !== topBefore;
+      await sleep(STEP_PAUSE_MS);
+      const deadline = performance.now() + LOAD_TIMEOUT_MS;
+      while (loading() && performance.now() < deadline) await sleep(250);
+      const after = interrupted();
+      if (after) return report(step - 1, true, after);
+      capture();
+      // At the top, nothing moves and nothing more loads.
+      unchanged = moved || container.scrollHeight !== heightBefore ? 0 : unchanged + 1;
+      report(step, false);
+      if (unchanged >= 3) return report(step, true, 'Reached the beginning');
+    }
+    report(maxSteps, true, 'Stopped at the step limit');
+  } finally {
+    removeEventListener('wheel', takeOver, { capture: true });
+    removeEventListener('touchmove', takeOver, { capture: true });
   }
-  report(maxSteps, true, 'Stopped at the step limit');
 }
 
 chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendResponse) => {
   if (message.type === 'read-history') void readHistory(Math.min(Math.max(message.maxSteps, 1), 200));
-  if (message.type === 'stop-history') historyRun++;
+  if (message.type === 'stop-history') {
+    stopReason = 'Stopped';
+    historyRun++;
+  }
   if (message.type === 'diagnose') sendResponse(diagnose(document));
+  if (message.type === 'get-thread') sendResponse(threadIdFromPath(location.pathname));
   return false;
 });
