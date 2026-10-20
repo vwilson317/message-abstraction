@@ -2,13 +2,16 @@ import { serveStatic } from '@hono/node-server/serve-static';
 import { Hono, type Context, type MiddlewareHandler } from 'hono';
 import { bodyLimit } from 'hono/body-limit';
 import { streamSSE } from 'hono/streaming';
-import { existsSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
+import { createReadStream, existsSync } from 'node:fs';
+import { stat } from 'node:fs/promises';
 import { join, relative } from 'node:path';
+import { Readable } from 'node:stream';
 import { HubError, type Hub } from '../core/hub';
 import { mimeForFile } from '../core/media';
 import { archiveFromBuffer } from '../importers/archive';
 import { importArchive, type ImportOptions } from '../importers/index';
+import type { GroupAlerts, GroupChange } from '../core/groups';
+import { computeGroupMetrics } from '../insights/groups';
 import { computeStats } from '../insights/stats';
 import { formatTranscript } from '../insights/transcript';
 
@@ -58,16 +61,82 @@ function localOnly(allowedHosts: string[], extensionIds: string[]): MiddlewareHa
   };
 }
 
-/** Media can come from exports or another app's folders, so it's never trusted to run. */
+/**
+ * A single `bytes=` range, clamped to the file. Null means serve the whole
+ * file: no header, a malformed one, or several ranges (allowed by RFC 9110).
+ */
+export function parseRange(
+  header: string | undefined,
+  size: number,
+): { start: number; end: number } | 'unsatisfiable' | null {
+  const m = header?.trim().match(/^bytes=(\d*)-(\d*)$/i);
+  if (!m || (m[1] === '' && m[2] === '')) return null;
+  if (m[1] === '') {
+    // A suffix: the last N bytes.
+    const length = Number(m[2]);
+    return length === 0 || size === 0 ? 'unsatisfiable' : { start: Math.max(0, size - length), end: size - 1 };
+  }
+  const start = Number(m[1]);
+  if (m[2] !== '' && Number(m[2]) < start) return null; // invalid, so ignored
+  if (start >= size) return 'unsatisfiable';
+  return { start, end: m[2] === '' ? size - 1 : Math.min(Number(m[2]), size - 1) };
+}
+
+/**
+ * Media can come from exports or another app's folders, so it's never trusted
+ * to run, and other sites may not embed it. Files can be gigabytes (WhatsApp
+ * videos and documents), so they're streamed, with byte ranges for seeking.
+ */
 async function mediaResponse(c: Context, path: string): Promise<Response> {
+  // Connector media ids are small sequential numbers; don't let other sites probe them.
+  if (c.req.header('sec-fetch-site') === 'cross-site') return c.json({ error: 'Cross-site request refused' }, 403);
+  let size: number;
+  try {
+    const stats = await stat(path);
+    if (!stats.isFile()) return c.json({ error: 'Not found' }, 404);
+    size = stats.size;
+  } catch {
+    return c.json({ error: 'Not found' }, 404);
+  }
   const type = mimeForFile(path) ?? 'application/octet-stream';
-  return c.body(await readFile(path), 200, {
+  const headers: Record<string, string> = {
     'Content-Type': type,
     'Content-Disposition': SAFE_INLINE.test(type) ? 'inline' : 'attachment',
     'Content-Security-Policy': 'sandbox',
     'X-Content-Type-Options': 'nosniff',
+    'Cross-Origin-Resource-Policy': 'same-origin',
     'Cache-Control': 'private, max-age=31536000, immutable',
-  });
+    'Accept-Ranges': 'bytes',
+  };
+  const range = parseRange(c.req.header('range'), size);
+  if (range === 'unsatisfiable') {
+    return c.body(null, 416, { ...headers, 'Content-Range': `bytes */${size}` });
+  }
+  const { start, end } = range ?? { start: 0, end: size - 1 };
+  const length = Math.max(0, end - start + 1);
+  headers['Content-Length'] = String(length);
+  if (range) headers['Content-Range'] = `bytes ${start}-${end}/${size}`;
+  const status = range ? 206 : 200;
+  if (c.req.method === 'HEAD' || length === 0) return c.body(null, status, headers);
+  const stream = Readable.toWeb(createReadStream(path, { start, end })) as unknown as ReadableStream<Uint8Array>;
+  return c.body(stream, status, headers);
+}
+
+/** Only this app and the extension's side panel may frame the UI (no clickjacking). */
+function frameAncestors(extensionIds: string[]): string {
+  const extensions = extensionIds.length
+    ? extensionIds.map((id) => `chrome-extension://${id.replace(/[^a-z0-9]/gi, '')}`).join(' ')
+    : 'chrome-extension:';
+  return `frame-ancestors 'self' ${extensions}`;
+}
+
+function parseGroupChange(body: { group?: unknown; dateAt?: unknown }): GroupChange {
+  if (body.group === 'dates') {
+    if (typeof body.dateAt !== 'number' || !Number.isFinite(body.dateAt)) throw new HubError('A date needs "dateAt"');
+    return { group: 'dates', dateAt: body.dateAt };
+  }
+  if (body.group === 'close' || body.group === 'romantic' || body.group === 'ghosts') return { group: body.group };
+  throw new HubError(`Unknown group "${String(body.group)}"`);
 }
 
 async function jsonBody<T>(c: Context): Promise<Partial<T>> {
@@ -128,9 +197,11 @@ export function createApp(hub: Hub, options: AppOptions): Hono {
   api.get('/conversations', (c) => c.json(hub.store.listConversations()));
   api.get('/conversations/:id', (c) => c.json(hub.requireConversation(c.req.param('id'))));
   api.patch('/conversations/:id', async (c) => {
-    const body = await jsonBody<{ selfParticipantId: string | null }>(c);
-    if (body.selfParticipantId === undefined) throw new HubError('Nothing to update');
-    return c.json(hub.setSelf(c.req.param('id'), body.selfParticipantId));
+    const body = await jsonBody<{ selfParticipantId: string | null; group: string; dateAt: number }>(c);
+    const id = c.req.param('id');
+    if (body.group !== undefined) return c.json(hub.setGroup(id, parseGroupChange(body)));
+    if (body.selfParticipantId !== undefined) return c.json(hub.setSelf(id, body.selfParticipantId));
+    throw new HubError('Nothing to update');
   });
   api.delete('/conversations/:id', (c) => {
     hub.deleteConversation(c.req.param('id'));
@@ -147,7 +218,21 @@ export function createApp(hub: Hub, options: AppOptions): Hono {
   // ── Insights ────────────────────────────────────────────────────────────
   api.get('/conversations/:id/insights', (c) => {
     const conversation = hub.requireConversation(c.req.param('id'));
-    return c.json(computeStats(conversation, hub.store.allMessages(conversation.id)));
+    const messages = hub.store.allMessages(conversation.id);
+    return c.json({
+      ...computeStats(conversation, messages),
+      groupMetrics: computeGroupMetrics(conversation, messages),
+    });
+  });
+
+  // ── Settings ────────────────────────────────────────────────────────────
+  api.get('/settings', (c) => c.json(hub.settings()));
+  api.patch('/settings', async (c) => {
+    const body = await jsonBody<{ groupAlerts: Partial<GroupAlerts> }>(c);
+    if (body.groupAlerts !== undefined && (typeof body.groupAlerts !== 'object' || body.groupAlerts === null)) {
+      throw new HubError('"groupAlerts" must be an object');
+    }
+    return c.json(hub.updateSettings({ ...(body.groupAlerts && { groupAlerts: body.groupAlerts }) }));
   });
   api.get('/conversations/:id/transcript', (c) => {
     const conversation = hub.requireConversation(c.req.param('id'));
@@ -218,11 +303,11 @@ export function createApp(hub: Hub, options: AppOptions): Hono {
   app.route('/api', api);
 
   if (options.staticDir && existsSync(options.staticDir)) {
-    // Only this app and the extension's side panel may frame the UI (no clickjacking).
+    const framing = frameAncestors(options.extensionIds);
     app.use('/*', async (c, next) => {
       await next();
       if (c.res.headers.get('content-type')?.startsWith('text/html')) {
-        c.res.headers.set('Content-Security-Policy', "frame-ancestors 'self' chrome-extension:");
+        c.res.headers.set('Content-Security-Policy', framing);
       }
     });
     // serveStatic resolves `root` against the working directory.

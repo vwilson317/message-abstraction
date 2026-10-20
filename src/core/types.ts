@@ -6,11 +6,13 @@
  * This file is shared with the web client, so it must stay free of Node imports.
  */
 
+import type { AssignedGroup, GroupAlerts } from './groups';
+
 export type Platform = 'whatsapp' | 'instagram';
 
 /**
- * `live` conversations come from a running connector and can usually be replied to.
- * `import` conversations are read-only snapshots loaded from an export file.
+ * `live` conversations mirror an app running on this machine; you reply in that app.
+ * `import` conversations are snapshots loaded from an export file.
  */
 export type SourceKind = 'live' | 'import';
 
@@ -36,6 +38,12 @@ export interface Conversation {
   lastMessagePreview: string | null;
   unreadCount: number;
   messageCount: number;
+  /** Close friends, Romantic interests or Ghosts, as you set it. See core/groups.ts for Dates and automatic Ghosts. */
+  group: AssignedGroup;
+  /** A scheduled date, epoch ms. */
+  dateAt: number | null;
+  /** When the group or date was last changed, epoch ms. */
+  groupSetAt: number | null;
 }
 
 export type MessageKind = 'text' | 'media' | 'system';
@@ -103,4 +111,10 @@ export type HubEvent =
   | { type: 'message.upserted'; message: Message }
   /** Many messages changed at once (history sync, import); clients should reload the conversation. */
   | { type: 'messages.bulk'; conversationId: string }
-  | { type: 'connector.status'; status: ConnectorStatus };
+  | { type: 'connector.status'; status: ConnectorStatus }
+  | { type: 'settings.updated'; settings: Settings };
+
+export interface Settings {
+  /** Desktop alerts for new messages, per group. */
+  groupAlerts: GroupAlerts;
+}

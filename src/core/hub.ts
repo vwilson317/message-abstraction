@@ -2,6 +2,7 @@ import { EventEmitter } from 'node:events';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Store } from '../store/db';
+import { applyGroupChange, dateIsOn, DEFAULT_GROUP_ALERTS, type GroupAlerts, type GroupChange } from './groups';
 import type { MediaStore } from './media';
 import type {
   Connector,
@@ -19,6 +20,7 @@ import type {
   HubEvent,
   Message,
   Participant,
+  Settings,
   SourceKind,
 } from './types';
 
@@ -44,6 +46,8 @@ export class Hub {
   private readonly events = new EventEmitter();
   private readonly connectors = new Map<string, Connector>();
   private readonly statuses = new Map<string, ConnectorStatus>();
+  /** Connectors started and not stopped since. Their displayed state can read "stopped" while idle. */
+  private readonly running = new Set<string>();
 
   constructor(
     readonly store: Store,
@@ -81,22 +85,36 @@ export class Hub {
     return [...this.statuses.values()];
   }
 
-  /** Start every connector whose app looks present on this machine. */
+  /** Start every connector whose app looks present on this machine, side by side. */
   async autoStart(): Promise<void> {
-    for (const connector of this.connectors.values()) {
-      if (await connector.shouldAutoStart(this.dirFor(connector))) await this.startConnector(connector.id);
-    }
+    await Promise.all(
+      [...this.connectors.values()].map(async (connector) => {
+        try {
+          if (await connector.shouldAutoStart(this.dirFor(connector))) await this.startConnector(connector.id);
+        } catch (err) {
+          this.log('error', `[${connector.id}] Could not start`, err);
+        }
+      }),
+    );
   }
 
   async startConnector(id: string): Promise<void> {
     const connector = this.requireConnector(id);
     const state = this.statuses.get(id)?.state;
-    if (state && state !== 'stopped' && state !== 'error') return;
-    await connector.start(this.contextFor(connector));
+    // A failed start (error, needs setup) can be retried; a running one is left alone.
+    if (this.running.has(id) && state !== 'error' && state !== 'needs_setup') return;
+    this.running.add(id);
+    try {
+      await connector.start(this.contextFor(connector));
+    } catch (err) {
+      this.running.delete(id);
+      throw err;
+    }
   }
 
   async stopConnector(id: string): Promise<void> {
     await this.requireConnector(id).stop();
+    this.running.delete(id);
     this.updateStatus(id, { state: 'stopped' });
   }
 
@@ -105,7 +123,7 @@ export class Hub {
   }
 
   /** Hand a browser-extension capture to the source it belongs to. */
-  receive(id: string, body: unknown): { conversationId: string; added: number } {
+  receive(id: string, body: unknown): { conversationId: string; added: number; skipped?: string } {
     const connector = this.requireConnector(id);
     if (!connector.receive) throw new HubError(`${connector.label} doesn't accept captures`, 404);
     return connector.receive(body);
@@ -131,6 +149,8 @@ export class Hub {
   private updateStatus(id: string, patch: Partial<ConnectorStatus>): void {
     const current = this.statuses.get(id);
     if (!current) return;
+    // Sources report the same status on every poll; only changes are news.
+    if ((patch.state ?? current.state) === current.state && patch.detail === current.detail) return;
     // `detail` only makes sense for the state it arrived with.
     const next: ConnectorStatus = {
       id: current.id,
@@ -158,6 +178,7 @@ export class Hub {
       upsertConversation: (input) => this.upsertConversation(connector.id, 'live', input),
       upsertMessages: (inputs, options) => this.upsertMessages(connector.id, 'live', inputs, options),
       patchMessage: (patch) => this.patchMessage(connector.id, patch),
+      retireConversation: (from, into) => this.retireConversation(connector.id, from, into),
     };
   }
 
@@ -189,7 +210,10 @@ export class Hub {
         }
         const id = `${conversationId}:${input.nativeId}`;
         const existing = this.store.getMessage(id);
-        const message = existing ? mergeMessage(existing, input) : newMessage(id, conversationId, input);
+        if (existing && options.onlyIfNew) continue;
+        const message = existing
+          ? mergeMessage(existing, input, options.authoritative ?? false)
+          : newMessage(id, conversationId, input);
         // Mirrors re-read the same rows often; unchanged rows cost no write and no event.
         if (existing && sameMessage(existing, message)) continue;
         this.store.saveMessage(message);
@@ -244,6 +268,47 @@ export class Hub {
     this.refreshPreviewIfLatest(message);
   }
 
+  /** See ConnectorContext.retireConversation. */
+  retireConversation(sourceId: string, fromNativeId: string, intoNativeId: string): void {
+    const from = this.store.getConversation(`${sourceId}:${fromNativeId}`);
+    if (!from || fromNativeId === intoNativeId) return;
+    const intoId = `${sourceId}:${intoNativeId}`;
+    let into = this.store.getConversation(intoId) ?? {
+      ...from,
+      id: intoId,
+      nativeId: intoNativeId,
+      group: 'close' as const,
+      dateAt: null,
+      groupSetAt: null,
+      messageCount: 0,
+      lastMessageAt: null,
+      lastMessagePreview: null,
+    };
+    // Whichever side was placed in a group more recently decides.
+    if ((from.groupSetAt ?? -1) > (into.groupSetAt ?? -1)) {
+      into = { ...into, group: from.group, dateAt: from.dateAt, groupSetAt: from.groupSetAt };
+    }
+    this.store.transaction(() => {
+      this.store.saveConversation(into);
+      for (const message of this.store.allMessages(from.id)) {
+        const id = `${intoId}:${message.nativeId}`;
+        if (!this.store.getMessage(id)) this.store.saveMessage({ ...message, id, conversationId: intoId });
+      }
+      this.store.deleteConversation(from.id);
+      const latest = this.store.latestMessage(intoId);
+      into = {
+        ...into,
+        messageCount: this.store.countMessages(intoId),
+        lastMessageAt: latest?.timestamp ?? null,
+        lastMessagePreview: latest ? preview(latest, into.isGroup) : null,
+      };
+      this.store.saveConversation(into);
+    });
+    this.emit({ type: 'conversation.deleted', conversationId: from.id });
+    this.emit({ type: 'conversation.upserted', conversation: into });
+    this.emit({ type: 'messages.bulk', conversationId: intoId });
+  }
+
   markRead(conversationId: string): Conversation {
     const conversation = this.requireConversation(conversationId);
     if (conversation.unreadCount === 0) return conversation;
@@ -251,6 +316,35 @@ export class Hub {
     this.store.saveConversation(next);
     this.emit({ type: 'conversation.upserted', conversation: next });
     return next;
+  }
+
+  /** Move a conversation between groups, or schedule a date (see core/groups.ts). */
+  setGroup(conversationId: string, change: GroupChange, now = Date.now()): Conversation {
+    const conversation = this.requireConversation(conversationId);
+    if (change.group === 'dates' && !(Number.isFinite(change.dateAt) && dateIsOn({ dateAt: change.dateAt }, now))) {
+      throw new HubError('That date has already passed');
+    }
+    const next: Conversation = { ...conversation, ...applyGroupChange(conversation, change, now) };
+    this.store.saveConversation(next);
+    this.emit({ type: 'conversation.upserted', conversation: next });
+    return next;
+  }
+
+  settings(): Settings {
+    return { groupAlerts: { ...DEFAULT_GROUP_ALERTS, ...this.store.getSetting<Partial<GroupAlerts>>('groupAlerts') } };
+  }
+
+  updateSettings(patch: { groupAlerts?: Partial<GroupAlerts> }): Settings {
+    if (patch.groupAlerts) {
+      const current = this.settings().groupAlerts;
+      for (const [key, value] of Object.entries(patch.groupAlerts)) {
+        if (!(key in current) || typeof value !== 'boolean') throw new HubError(`Unknown alert setting "${key}"`);
+      }
+      this.store.setSetting('groupAlerts', { ...current, ...patch.groupAlerts });
+    }
+    const settings = this.settings();
+    this.emit({ type: 'settings.updated', settings });
+    return settings;
   }
 
   /** For imports, where the export doesn't say which participant is the account owner. */
@@ -306,6 +400,9 @@ export class Hub {
         lastMessagePreview: null,
         unreadCount: input.unreadCount ?? 0,
         messageCount: 0,
+        group: 'close',
+        dateAt: null,
+        groupSetAt: null,
       };
     }
     return {
@@ -362,20 +459,29 @@ function newMessage(id: string, conversationId: string, input: MessageInput): Me
   };
 }
 
-/** A re-delivered message (history sync, re-import) must not undo edits, deletes or receipts. */
-function mergeMessage(existing: Message, input: MessageInput): Message {
+/**
+ * A re-delivered message (history sync, re-import) must not undo edits,
+ * deletes or receipts. An authoritative source shows the message as it is
+ * now, so its text wins, and a change to it is an edit.
+ */
+function mergeMessage(existing: Message, input: MessageInput, authoritative: boolean): Message {
+  const deleted = existing.deleted || (input.deleted ?? false);
+  const changed = existing.text !== null && input.text !== null && input.text !== existing.text;
+  const takeText = authoritative || input.edited || !existing.edited;
   return {
     ...existing,
+    senderId: input.senderId || existing.senderId,
     senderName: input.senderName || existing.senderName,
     kind: existing.deleted ? existing.kind : input.kind,
-    // An edited input carries the current text; otherwise don't let a stale copy undo an edit.
-    text: existing.deleted ? existing.text : input.edited || !existing.edited ? input.text : existing.text,
-    attachments: existing.deleted ? [] : mergeAttachments(existing.attachments, input.attachments ?? []),
-    reactions: input.reactions?.length ? input.reactions : existing.reactions,
+    // Otherwise an edited input carries the current text, and a stale copy can't undo an edit.
+    text: deleted ? null : takeText ? input.text : existing.text,
+    attachments: deleted ? [] : mergeAttachments(existing.attachments, input.attachments ?? []),
+    // A source that reports reactions reports all of them, so an empty list clears them.
+    reactions: input.reactions ?? existing.reactions,
     replyToNativeId: input.replyToNativeId ?? existing.replyToNativeId,
     status: input.status ? higherStatus(existing.status, input.status) : existing.status,
-    edited: existing.edited || (input.edited ?? false),
-    deleted: existing.deleted || (input.deleted ?? false),
+    edited: existing.edited || (input.edited ?? false) || (authoritative && changed && !deleted),
+    deleted,
   };
 }
 

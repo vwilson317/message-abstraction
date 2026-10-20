@@ -17,6 +17,12 @@ export interface Config {
   };
 }
 
+/** A blank or bad value must not turn polling into a busy loop. */
+function pollInterval(value: string | undefined): number {
+  const ms = Number(value);
+  return value?.trim() && Number.isFinite(ms) && ms >= 250 ? ms : 1500;
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   // Variables already set in the environment win over the file.
   if (env === process.env && existsSync('.env')) process.loadEnvFile('.env');
@@ -41,7 +47,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
         : process.platform === 'darwin'
           ? DEFAULT_WHATSAPP_CONTAINER
           : null,
-      pollMs: Number(env.WHATSAPP_POLL_MS ?? 1500),
+      pollMs: pollInterval(env.WHATSAPP_POLL_MS),
     },
   };
 }

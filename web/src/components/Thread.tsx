@@ -3,13 +3,21 @@ import { api, type Conversation, type ConnectorStatus, type Message } from '../a
 import { subscribe } from '../events';
 import { dayLabel, plural, sameDay } from '../format';
 import { Avatar } from './Avatar';
+import { useLongPress } from '../useLongPress';
+import { GroupChip } from './GroupChip';
 import { MessageBubble } from './MessageBubble';
 
 interface Props {
   conversation: Conversation;
   connector: ConnectorStatus | undefined;
   /** Without these the thread renders headerless, for the companion view. */
-  header?: { insightsOpen: boolean; onToggleInsights: () => void; onBack: () => void };
+  header?: {
+    insightsOpen: boolean;
+    onToggleInsights: () => void;
+    onBack: () => void;
+    now: number;
+    onMove: (at: { x: number; y: number }) => void;
+  };
   onOpenSources: () => void;
   onError: (message: string) => void;
 }
@@ -74,6 +82,7 @@ function useMessages(conversationId: string, onError: (message: string) => void)
 export function Thread(props: Props) {
   const { conversation, connector, onError } = props;
   const { messages, loading, hasOlder, loadOlder } = useMessages(conversation.id, onError);
+  const headerPress = useLongPress((at) => props.header?.onMove(at));
   const scroller = useRef<HTMLDivElement>(null);
   const anchor = useRef<{ height: number; top: number } | null>(null);
   const stickToBottom = useRef(true);
@@ -158,10 +167,11 @@ export function Thread(props: Props) {
             ‹
           </button>
           <Avatar name={conversation.title} platform={conversation.platform} size={38} />
-          <div className="thread-heading">
+          <div className="thread-heading" {...headerPress}>
             <h2>{conversation.title}</h2>
             <p>{subtitle}</p>
           </div>
+          <GroupChip conversation={conversation} now={props.header.now} onMove={props.header.onMove} />
           <button
             className={`btn btn-quiet ${props.header.insightsOpen ? 'active' : ''}`}
             onClick={props.header.onToggleInsights}

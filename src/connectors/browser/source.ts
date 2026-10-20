@@ -3,10 +3,8 @@ import { HubError } from '../../core/hub';
 import type { AttachmentType, Platform } from '../../core/types';
 import { alignCapture, type StoredItem } from './align';
 
-export type StoredTail = (conversationId: string, range: { from: number; to: number } | null) => StoredItem[];
-
-/** How far around a capture's own timestamps to look for already-stored messages. */
-const RANGE_MARGIN_MS = 3 * 24 * 60 * 60 * 1000;
+/** Stored messages of a conversation, oldest first: what a capture is lined up against. */
+export type StoredTail = (conversationId: string) => StoredItem[];
 
 /**
  * A conversation as the browser extension saw it on screen. Pages like
@@ -22,6 +20,8 @@ export interface Capture {
   };
   /** Display order, oldest first. */
   messages: CapturedMessage[];
+  /** The window reaches the newest message in the thread. */
+  atBottom?: boolean;
 }
 
 export interface CapturedMessage {
@@ -66,7 +66,7 @@ function text(value: unknown, field: string, max = 20_000): string {
 /** Validate untrusted JSON from the extension into a Capture. */
 export function parseCapture(body: unknown): Capture {
   if (!body || typeof body !== 'object') fail('expected an object');
-  const { thread, messages } = body as Record<string, unknown>;
+  const { thread, messages, atBottom } = body as Record<string, unknown>;
   if (!thread || typeof thread !== 'object') fail('missing thread');
   const t = thread as Record<string, unknown>;
   const id = text(t.id, 'thread.id', 200);
@@ -82,6 +82,7 @@ export function parseCapture(body: unknown): Capture {
         participants: t.participants.filter((p): p is string => typeof p === 'string').map((p) => p.slice(0, 200)),
       }),
     },
+    ...(typeof atBottom === 'boolean' && { atBottom }),
     messages: messages.map((raw, i): CapturedMessage => {
       if (!raw || typeof raw !== 'object') fail(`messages[${i}] must be an object`);
       const m = raw as Record<string, unknown>;
@@ -115,6 +116,13 @@ export function parseCapture(body: unknown): Capture {
   };
 }
 
+export interface CaptureResult {
+  conversationId: string;
+  added: number;
+  /** Why nothing was stored, when the window couldn't be placed. */
+  skipped?: string;
+}
+
 /**
  * Receives what the browser extension reads from a messaging site open in a
  * tab. The extension pushes; this side keeps status and turns captures into
@@ -130,7 +138,7 @@ export class BrowserSource implements Connector {
     readonly platform: Platform,
     readonly label: string,
     private readonly setupHint: string,
-    /** Stored messages to align a capture against: around its timestamps, or the newest. */
+    /** Stored messages to align a capture against. */
     private readonly storedTail: StoredTail,
   ) {}
 
@@ -139,6 +147,7 @@ export class BrowserSource implements Connector {
   }
 
   async start(ctx: ConnectorContext): Promise<void> {
+    clearInterval(this.timer);
     this.ctx = ctx;
     this.refreshStatus();
     this.timer = setInterval(() => this.refreshStatus(), 15_000);
@@ -147,62 +156,78 @@ export class BrowserSource implements Connector {
   async stop(): Promise<void> {
     clearInterval(this.timer);
     this.timer = undefined;
+    // Stopped means stopped: captures are refused until Start.
+    this.ctx = undefined;
   }
 
-  receive(body: unknown): { conversationId: string; added: number } {
+  receive(body: unknown): CaptureResult {
     return this.ingest(parseCapture(body));
   }
 
   /** The extension checks in while a matching tab is open. */
   heartbeat(): void {
+    if (!this.ctx) throw new HubError(`${this.label} is stopped`, 503);
     this.lastSeen = Date.now();
     this.refreshStatus();
   }
 
-  ingest(capture: Capture): { conversationId: string; added: number } {
+  ingest(capture: Capture): CaptureResult {
     const ctx = this.ctx;
     if (!ctx) throw new HubError(`${this.label} is stopped`, 503);
     this.heartbeat();
     const { thread } = capture;
     const conversationId = `${this.id}:${thread.id}`;
-    // Incoming messages use the sender's name as their id, and yours use "me".
-    const others = thread.participants ?? (thread.isGroup ? [] : [thread.title]);
-    ctx.upsertConversation({
+    // One window can't prove a thread is 1:1 (one speaker may just be all that's
+    // on screen), so a thread seen as a group stays one.
+    let conversation = ctx.upsertConversation({
       platform: this.platform,
       nativeId: thread.id,
       title: thread.title,
-      ...(thread.isGroup !== undefined && { isGroup: thread.isGroup }),
-      participants: [
-        ...others.map((name) => ({ id: name, name, isSelf: false })),
-        { id: 'me', name: 'You', isSelf: true },
-      ],
+      ...(thread.isGroup && { isGroup: true }),
     });
+    const isGroup = conversation.isGroup;
+    // Incoming messages use the sender's name as their id, and yours use "me".
+    const others = thread.participants ?? (isGroup ? [] : [thread.title]);
+    const known = new Set(conversation.participants.map((p) => p.id));
+    if (!known.has('me') || others.some((name) => !known.has(name))) {
+      conversation = ctx.upsertConversation({
+        platform: this.platform,
+        nativeId: thread.id,
+        participants: [
+          ...others.map((name) => ({ id: name, name, isSelf: false })),
+          { id: 'me', name: 'You', isSelf: true },
+        ],
+      });
+    }
 
-    const stamps = capture.messages.map((m) => m.timestamp).filter((t): t is number => t !== undefined);
-    const range = stamps.length
-      ? { from: Math.min(...stamps) - RANGE_MARGIN_MS, to: Math.max(...stamps) + RANGE_MARGIN_MS }
-      : null;
-    const aligned = alignCapture(capture.messages, this.storedTail(conversationId, range));
-    const inputs: MessageInput[] = aligned.map(({ message, nativeId, timestamp, isNew }) => ({
-      conversationNativeId: thread.id,
-      nativeId,
-      senderId: message.fromSelf ? 'me' : message.senderName || 'unknown',
-      // An empty name on a known message keeps the name stored earlier.
-      senderName: message.fromSelf ? 'You' : message.senderName || (isNew ? 'Unknown' : ''),
-      fromSelf: message.fromSelf,
-      timestamp,
-      kind: message.attachments?.length && !message.text ? 'media' : 'text',
-      text: message.deleted ? null : message.text,
-      attachments: message.deleted ? [] : (message.attachments ?? []),
-      reactions: (message.reactions ?? []).map((r) => ({
-        emoji: r.emoji,
-        senderId: r.senderName,
-        senderName: r.senderName,
-      })),
-      deleted: message.deleted ?? false,
-    }));
+    const aligned = alignCapture(capture.messages, this.storedTail(conversationId), {
+      ...(capture.atBottom !== undefined && { atBottom: capture.atBottom }),
+    });
+    if ('skipped' in aligned) return { conversationId, added: 0, skipped: aligned.skipped };
+    const inputs: MessageInput[] = aligned.messages.map(({ message, nativeId, timestamp, isNew, edited }) => {
+      // In a group, a page that named the sender after the thread didn't know who it was.
+      const name = isGroup && message.senderName === thread.title ? '' : message.senderName;
+      return {
+        conversationNativeId: thread.id,
+        nativeId,
+        // An empty sender on a known message keeps the one stored earlier.
+        senderId: message.fromSelf ? 'me' : name || (isNew ? 'unknown' : ''),
+        senderName: message.fromSelf ? 'You' : name || (isNew ? 'Unknown' : ''),
+        fromSelf: message.fromSelf,
+        timestamp,
+        kind: message.attachments?.length && !message.text ? 'media' : 'text',
+        text: message.deleted ? null : message.text,
+        attachments: message.deleted ? [] : (message.attachments ?? []),
+        // A bubble without visible reactions may just not be showing them; keep what's stored.
+        reactions: message.reactions?.length
+          ? message.reactions.map((r) => ({ emoji: r.emoji, senderId: r.senderName, senderName: r.senderName }))
+          : undefined,
+        ...(edited && { edited: true }),
+        deleted: message.deleted ?? false,
+      };
+    });
     ctx.upsertMessages(inputs, { countUnread: false });
-    return { conversationId, added: aligned.filter((a) => a.isNew).length };
+    return { conversationId, added: aligned.messages.filter((a) => a.isNew).length };
   }
 
   private refreshStatus(): void {

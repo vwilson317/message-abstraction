@@ -1,7 +1,11 @@
-import type { ConversationStats } from '../../src/insights/stats';
-import type { Conversation, ConnectorStatus, Message, MessagePage, Platform } from '../../src/core/types';
+import type { GroupAlerts, GroupChange } from '../../src/core/groups';
+import type { GroupMetrics } from '../../src/insights/groups';
+import type { ConversationStats as BaseStats } from '../../src/insights/stats';
+import type { Conversation, ConnectorStatus, Message, MessagePage, Platform, Settings } from '../../src/core/types';
 
-export type { ConversationStats };
+export type ConversationStats = BaseStats & { groupMetrics: GroupMetrics };
+export type * from '../../src/core/groups';
+export type * from '../../src/insights/groups';
 export type * from '../../src/core/types';
 
 export interface ImportSummary {
@@ -36,6 +40,11 @@ export const api = {
   conversations: () => request<Conversation[]>('/api/conversations'),
   setSelf: (id: string, selfParticipantId: string | null) =>
     request<Conversation>(`/api/conversations/${enc(id)}`, json('PATCH', { selfParticipantId })),
+  setGroup: (id: string, change: GroupChange) =>
+    request<Conversation>(`/api/conversations/${enc(id)}`, json('PATCH', change)),
+  settings: () => request<Settings>('/api/settings'),
+  updateSettings: (groupAlerts: Partial<GroupAlerts>) =>
+    request<Settings>('/api/settings', json('PATCH', { groupAlerts })),
   deleteConversation: (id: string) => request<void>(`/api/conversations/${enc(id)}`, { method: 'DELETE' }),
   markRead: (id: string) => request<Conversation>(`/api/conversations/${enc(id)}/read`, { method: 'POST' }),
 

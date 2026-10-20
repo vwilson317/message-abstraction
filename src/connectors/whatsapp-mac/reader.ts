@@ -1,7 +1,7 @@
 import type { DatabaseSync, SQLOutputValue } from 'node:sqlite';
 import type { ConversationInput, MessageInput } from '../../core/connector';
 import type { Attachment, AttachmentType, MessageKind, Participant, Reaction } from '../../core/types';
-import { decodeReactions } from './protobuf';
+import { decodeQuote, decodeReactions, type Quote } from './protobuf';
 
 /**
  * Reads WhatsApp Desktop for macOS's own message store (ChatStorage.sqlite), a
@@ -23,15 +23,18 @@ export function appleDateToMs(value: SQLOutputValue | undefined): number | null 
   return Math.round((seconds + APPLE_EPOCH_OFFSET_S) * 1000);
 }
 
-/** ZWACHATSESSION.ZSESSIONTYPE: 0 one-to-one, 1 group; higher values are broadcasts, status, communities. */
-const SESSION_TYPE = { individual: 0, group: 1 } as const;
+/** ZWACHATSESSION.ZSESSIONTYPE: 0 one-to-one, 1 group, 4 a community's announcement group; others are broadcasts and status. */
+const SESSION_TYPE = { individual: 0, group: 1, announcements: 4 } as const;
 
 /**
  * ZWAMESSAGE.ZMESSAGETYPE codes that independent readers agree on. Others
  * (calls, polls, ...) disagree between projects, so they're shown as text
  * when they carry some and skipped otherwise.
  */
-const MESSAGE_TYPES: Record<number, { kind: MessageKind; attachment?: AttachmentType; deleted?: boolean }> = {
+const MESSAGE_TYPES: Record<
+  number,
+  { kind: MessageKind; attachment?: AttachmentType; deleted?: boolean; fallbackText?: string }
+> = {
   0: { kind: 'text' },
   1: { kind: 'media', attachment: 'image' },
   2: { kind: 'media', attachment: 'video' },
@@ -44,6 +47,8 @@ const MESSAGE_TYPES: Record<number, { kind: MessageKind; attachment?: Attachment
   11: { kind: 'media', attachment: 'video' }, // GIF
   14: { kind: 'text', deleted: true }, // deleted for everyone; ZTEXT may hold the deleting admin's JID
   15: { kind: 'media', attachment: 'sticker' },
+  54: { kind: 'media', attachment: 'video' },
+  59: { kind: 'system', fallbackText: '📞 Call' },
 };
 
 const IGNORED_JIDS = /(@broadcast|@newsletter|@call)$/;
@@ -141,28 +146,68 @@ export interface ChatRow {
   input: ConversationInput & { unreadCount: number };
 }
 
+/** The chat list at one moment, ready to upsert. */
+export interface ChatSnapshot {
+  chats: ChatRow[];
+  /** Conversation id of each visible chat session, by Z_PK. */
+  sessions: Map<number, string>;
+  /** LID chats now known by phone number: their old conversation folds into the phone-number one. */
+  folded: { from: string; into: string }[];
+}
+
 export interface MessageRow {
   pk: number;
   input: MessageInput;
   /** A local media file reference (`media:<Z_PK>`) for the connector to resolve, if any. */
   mediaRef: string | null;
-  /** History sync leaves lower-priority duplicate rows (ZSORT < 0) for some messages. */
+  /**
+   * History sync writes some rows with ZSORT < 0. Usually they're the only
+   * copy, but when a regular row exists too it wins.
+   */
   duplicate: boolean;
-  /** The parts of the stored row that can change later: edits, deletes, media arriving. */
-  state: { type: number; text: string | null; media: string | null };
+  /** The parts of the stored row that can change later: edits, deletes, media arriving, reactions. */
+  state: { type: number; text: string | null; media: string | null; reactions: string };
+  chatPk: number;
+  stanza: string | null;
+}
+
+export interface MessageBatch {
+  rows: MessageRow[];
+  /** Z_PK of the last row scanned, mapped or not: where the next batch starts. */
+  lastPk: number;
+  /** Rows scanned. Fewer than the limit means there's nothing more. */
+  scanned: number;
+  /** Set when a row named a chat the last snapshot didn't have, so the chat list was read again. */
+  snapshot: ChatSnapshot | null;
+}
+
+interface ChatInfo {
+  jid: string;
+  isGroup: boolean;
+  title: string;
 }
 
 export class ChatStorageReader {
   private readonly columns = new Map<string, Set<string>>();
-  private chats = new Map<number, { jid: string; isGroup: boolean; title: string }>();
+  /** Visible chats by ZWACHATSESSION.Z_PK. */
+  private chats = new Map<number, ChatInfo>();
+  /** Every chat session at the last snapshot, visible or not, to notice new ones. */
+  private sessions = new Set<number>();
+  /** Raw member JIDs of each group, to find the groups a newly mapped LID belongs to. */
+  private rawMembers = new Map<number, Set<string>>();
   private pushNames = new Map<string, string>();
   /** One-to-one chat titles by JID, the fallback for naming people elsewhere (reactions, groups). */
   private partnerNames = new Map<string, string>();
 
   constructor(
     private readonly db: DatabaseSync,
-    private readonly contacts: ContactBook = new ContactBook(),
+    private contacts: ContactBook = new ContactBook(),
   ) {}
+
+  /** Names and LID mappings changed; the next snapshot uses the new ones. */
+  setContacts(contacts: ContactBook): void {
+    this.contacts = contacts;
+  }
 
   private columnsOf(table: string): Set<string> {
     let cols = this.columns.get(table);
@@ -173,8 +218,9 @@ export class ChatStorageReader {
     return cols;
   }
 
-  hasTable(table: string): boolean {
-    return this.columnsOf(table).size > 0;
+  private has(table: string, ...cols: string[]): boolean {
+    const present = this.columnsOf(table);
+    return present.size > 0 && cols.every((c) => present.has(c));
   }
 
   /** Columns a usable store must have; reading without them would misread, so refuse instead. */
@@ -199,10 +245,6 @@ export class ChatStorageReader {
     return Number(this.db.prepare('PRAGMA data_version').get()?.data_version ?? 0);
   }
 
-  maxMessagePk(): number {
-    return Number(this.db.prepare('SELECT MAX(Z_PK) AS pk FROM ZWAMESSAGE').get()?.pk ?? 0);
-  }
-
   private nameFor(jid: string): string | undefined {
     const canonical = this.contacts.canonical(jid);
     return (
@@ -214,13 +256,17 @@ export class ChatStorageReader {
   }
 
   private loadPushNames(): void {
-    if (!this.columnsOf('ZWAPROFILEPUSHNAME').has('ZPUSHNAME')) return;
+    if (!this.has('ZWAPROFILEPUSHNAME', 'ZJID', 'ZPUSHNAME')) return;
     const rows = this.db.prepare('SELECT ZJID AS jid, ZPUSHNAME AS name FROM ZWAPROFILEPUSHNAME').all();
     this.pushNames = new Map(rows.filter((r) => str(r.jid) && str(r.name)).map((r) => [String(r.jid), String(r.name)]));
   }
 
-  /** One-to-one and group chats, skipping status, broadcasts, channels and hidden or removed chats. */
-  readChats(): ChatRow[] {
+  /**
+   * One-to-one and group chats with their members, skipping status,
+   * broadcasts, channels and hidden or removed chats. Run it inside the same
+   * read transaction as the messages it should explain.
+   */
+  snapshot(): ChatSnapshot {
     this.loadPushNames();
     const cols = this.select('ZWACHATSESSION', 'c', [
       'ZCONTACTJID',
@@ -231,16 +277,22 @@ export class ChatStorageReader {
       'ZHIDDEN',
     ]);
     const byJid = new Map<string, ChatRow>();
-    const chats = new Map<number, { jid: string; isGroup: boolean; title: string }>();
+    const chats = new Map<number, ChatInfo>();
+    const sessions = new Set<number>();
+    const folded = new Map<string, string>();
     for (const r of this.db.prepare(`SELECT c.Z_PK AS pk, ${cols} FROM ZWACHATSESSION c ORDER BY c.Z_PK`).all()) {
+      sessions.add(Number(r.pk));
       const raw = str(r.ZCONTACTJID);
       const type = Number(r.ZSESSIONTYPE ?? 0);
       if (!raw || IGNORED_JIDS.test(raw)) continue;
       if (Number(r.ZREMOVED ?? 0) === 1 || Number(r.ZHIDDEN ?? 0) === 1) continue;
-      if (type !== SESSION_TYPE.individual && type !== SESSION_TYPE.group) continue;
-      const isGroup = type === SESSION_TYPE.group || raw.endsWith('@g.us');
+      if (type !== SESSION_TYPE.individual && type !== SESSION_TYPE.group && type !== SESSION_TYPE.announcements) {
+        continue;
+      }
+      const isGroup = type !== SESSION_TYPE.individual || raw.endsWith('@g.us');
       // The same person can have a LID chat and a phone-number chat; show them as one.
       const jid = isGroup ? raw : this.contacts.canonical(raw);
+      if (jid !== raw) folded.set(raw, jid);
       const named = isGroup
         ? str(r.ZPARTNERNAME)
         : (this.contacts.name(jid) ?? str(r.ZPARTNERNAME) ?? this.nameFor(jid));
@@ -268,18 +320,28 @@ export class ChatStorageReader {
     // Messages in a merged LID chat should carry the merged chat's title.
     for (const chat of chats.values()) chat.title = byJid.get(chat.jid)?.input.title ?? chat.title;
     this.chats = chats;
+    this.sessions = sessions;
     this.partnerNames = new Map(
       [...byJid.values()]
         .filter((c) => !c.input.isGroup && c.input.title !== jidLabel(c.input.nativeId))
         .map((c) => [c.input.nativeId, c.input.title!]),
     );
-    return [...byJid.values()];
+
+    for (const [jid, participants] of this.readGroupMembers()) {
+      const chat = byJid.get(jid);
+      if (chat) chat.input.participants = [...participants, ...(chat.input.participants ?? [])];
+    }
+    return {
+      chats: [...byJid.values()],
+      sessions: new Map([...chats].map(([pk, chat]) => [pk, chat.jid])),
+      folded: [...folded].map(([from, into]) => ({ from, into })),
+    };
   }
 
-  /** Group membership, for participant lists. Call readChats() first. */
-  readGroupMembers(): Map<string, Participant[]> {
+  private readGroupMembers(): Map<string, Participant[]> {
     const members = new Map<string, Participant[]>();
-    if (!this.hasTable('ZWAGROUPMEMBER')) return members;
+    this.rawMembers = new Map();
+    if (!this.has('ZWAGROUPMEMBER', 'ZCHATSESSION', 'ZMEMBERJID')) return members;
     const cols = this.select('ZWAGROUPMEMBER', 'g', [
       'ZCHATSESSION',
       'ZMEMBERJID',
@@ -288,9 +350,15 @@ export class ChatStorageReader {
       'ZISACTIVE',
     ]);
     for (const r of this.db.prepare(`SELECT ${cols} FROM ZWAGROUPMEMBER g`).all()) {
-      const chat = this.chats.get(Number(r.ZCHATSESSION));
+      const pk = Number(r.ZCHATSESSION);
+      const chat = this.chats.get(pk);
       const raw = str(r.ZMEMBERJID);
-      if (!chat?.isGroup || !raw || r.ZISACTIVE === 0) continue;
+      if (!chat?.isGroup || !raw) continue;
+      // Former members still sent messages; their LIDs count for remapping.
+      const seen = this.rawMembers.get(pk) ?? new Set();
+      seen.add(raw);
+      this.rawMembers.set(pk, seen);
+      if (r.ZISACTIVE === 0) continue;
       const id = this.contacts.canonical(raw);
       const name =
         this.contacts.name(id) ?? str(r.ZCONTACTNAME) ?? str(r.ZFIRSTNAME) ?? this.nameFor(id) ?? jidLabel(id);
@@ -301,7 +369,13 @@ export class ChatStorageReader {
     return members;
   }
 
+  /** Group chats (by Z_PK) that have or had any of these JIDs as members. */
+  groupsWith(jids: Set<string>): number[] {
+    return [...this.rawMembers].filter(([, members]) => [...members].some((jid) => jids.has(jid))).map(([pk]) => pk);
+  }
+
   private messageQuery(where: string): string {
+    const msg = this.columnsOf('ZWAMESSAGE');
     const m = this.select('ZWAMESSAGE', 'm', [
       'ZCHATSESSION',
       'ZISFROMME',
@@ -312,35 +386,37 @@ export class ChatStorageReader {
       'ZSTANZAID',
       'ZPUSHNAME',
       'ZSORT',
-      'ZGROUPMEMBER',
-      'ZMEDIAITEM',
     ]);
     const parts = ['m.Z_PK AS pk', m];
     const joins: string[] = [];
 
-    if (this.hasTable('ZWAGROUPMEMBER')) {
+    if (msg.has('ZGROUPMEMBER') && this.has('ZWAGROUPMEMBER')) {
       parts.push(this.select('ZWAGROUPMEMBER', 'g', ['ZMEMBERJID', 'ZCONTACTNAME', 'ZFIRSTNAME'], 'G_'));
       joins.push('LEFT JOIN ZWAGROUPMEMBER g ON g.Z_PK = m.ZGROUPMEMBER');
     } else parts.push('NULL AS G_ZMEMBERJID, NULL AS G_ZCONTACTNAME, NULL AS G_ZFIRSTNAME');
 
-    const mediaCols = ['ZMEDIALOCALPATH', 'ZTITLE', 'ZLATITUDE', 'ZLONGITUDE', 'ZVCARDNAME'];
-    if (this.hasTable('ZWAMEDIAITEM') && this.columnsOf('ZWAMESSAGE').has('ZMEDIAITEM')) {
-      const present = this.columnsOf('ZWAMEDIAITEM');
-      // Versions link either way: message → media item, or media item → message.
-      const back = present.has('ZMESSAGE');
-      joins.push('LEFT JOIN ZWAMEDIAITEM mi ON mi.Z_PK = m.ZMEDIAITEM');
-      if (back) joins.push('LEFT JOIN ZWAMEDIAITEM mb ON COALESCE(m.ZMEDIAITEM, 0) = 0 AND mb.ZMESSAGE = m.Z_PK');
+    // ZMETADATA holds reply context, so even plain text can have a media item.
+    const mediaCols = ['ZMEDIALOCALPATH', 'ZTITLE', 'ZLATITUDE', 'ZLONGITUDE', 'ZVCARDNAME', 'ZMETADATA'];
+    const media = this.columnsOf('ZWAMEDIAITEM');
+    // Versions link either way: message → media item, or media item → message.
+    const forward = media.size > 0 && msg.has('ZMEDIAITEM');
+    const back = media.has('ZMESSAGE');
+    if (forward || back) {
+      if (forward) joins.push('LEFT JOIN ZWAMEDIAITEM mi ON mi.Z_PK = m.ZMEDIAITEM');
+      if (back) {
+        joins.push(
+          forward
+            ? 'LEFT JOIN ZWAMEDIAITEM mb ON COALESCE(m.ZMEDIAITEM, 0) = 0 AND mb.ZMESSAGE = m.Z_PK'
+            : 'LEFT JOIN ZWAMEDIAITEM mb ON mb.ZMESSAGE = m.Z_PK',
+        );
+      }
+      const from = (col: string) => [...(forward ? [`mi.${col}`] : []), ...(back ? [`mb.${col}`] : [])];
       const pick = (col: string) =>
-        present.has(col) ? `COALESCE(mi.${col}${back ? `, mb.${col}` : ''}) AS MI_${col}` : `NULL AS MI_${col}`;
-      parts.push(`COALESCE(mi.Z_PK${back ? ', mb.Z_PK' : ''}) AS MI_PK`, ...mediaCols.map(pick));
+        media.has(col) ? `COALESCE(${[...from(col), 'NULL'].join(', ')}) AS MI_${col}` : `NULL AS MI_${col}`;
+      parts.push(`COALESCE(${[...from('Z_PK'), 'NULL'].join(', ')}) AS MI_PK`, ...mediaCols.map(pick));
     } else parts.push('NULL AS MI_PK', ...mediaCols.map((c) => `NULL AS MI_${c}`));
 
-    if (this.columnsOf('ZWAMESSAGE').has('ZPARENTMESSAGE')) {
-      parts.push('p.ZSTANZAID AS P_ZSTANZAID, p.ZISFROMME AS P_ZISFROMME');
-      joins.push('LEFT JOIN ZWAMESSAGE p ON p.Z_PK = m.ZPARENTMESSAGE');
-    } else parts.push('NULL AS P_ZSTANZAID, NULL AS P_ZISFROMME');
-
-    if (this.columnsOf('ZWAMESSAGE').has('ZMESSAGEINFO') && this.columnsOf('ZWAMESSAGEINFO').has('ZRECEIPTINFO')) {
+    if (msg.has('ZMESSAGEINFO') && this.has('ZWAMESSAGEINFO', 'ZRECEIPTINFO')) {
       parts.push('info.ZRECEIPTINFO AS I_ZRECEIPTINFO');
       joins.push('LEFT JOIN ZWAMESSAGEINFO info ON info.Z_PK = m.ZMESSAGEINFO');
     } else parts.push('NULL AS I_ZRECEIPTINFO');
@@ -348,18 +424,91 @@ export class ChatStorageReader {
     return `SELECT ${parts.join(', ')} FROM ZWAMESSAGE m ${joins.join(' ')} WHERE ${where}`;
   }
 
-  /** Messages with Z_PK above `afterPk`, oldest first. Call readChats() first. */
-  readMessagesAfter(afterPk: number, limit: number): MessageRow[] {
-    const rows = this.db.prepare(`${this.messageQuery('m.Z_PK > ?')} ORDER BY m.Z_PK LIMIT ?`).all(afterPk, limit);
-    return rows.map((r) => this.toMessage(r)).filter((m): m is MessageRow => m !== null);
+  /**
+   * Rows with Z_PK above `afterPk` (and at most `untilPk`, optionally in some
+   * chats only), oldest first. Rows that don't map (status updates, hidden
+   * chats) are skipped but still move `lastPk` on.
+   */
+  readMessages(range: { afterPk: number; limit: number; untilPk?: number; chats?: number[] }): MessageBatch {
+    const where = ['m.Z_PK > ?'];
+    const params: number[] = [range.afterPk];
+    if (range.untilPk !== undefined) {
+      where.push('m.Z_PK <= ?');
+      params.push(range.untilPk);
+    }
+    if (range.chats) {
+      where.push(`m.ZCHATSESSION IN (${range.chats.map(() => '?').join(', ')})`);
+      params.push(...range.chats);
+    }
+    const raw = this.db
+      .prepare(`${this.messageQuery(where.join(' AND '))} ORDER BY m.Z_PK LIMIT ?`)
+      .all(...params, range.limit);
+    const { rows, snapshot } = this.mapRows(raw);
+    return { rows, lastPk: raw.length ? Number(raw.at(-1)!.pk) : range.afterPk, scanned: raw.length, snapshot };
   }
 
-  /** The newest `count` rows, to notice edits and deletes (which rewrite rows in place). */
-  readRecentMessages(count: number): MessageRow[] {
-    const rows = this.db
+  /** The newest `count` rows, to notice edits, deletes and reactions (which rewrite rows in place). */
+  readRecentMessages(count: number): { rows: MessageRow[]; snapshot: ChatSnapshot | null } {
+    const raw = this.db
       .prepare(`${this.messageQuery('m.Z_PK > (SELECT COALESCE(MAX(Z_PK), 0) - ? FROM ZWAMESSAGE)')} ORDER BY m.Z_PK`)
       .all(count);
-    return rows.map((r) => this.toMessage(r)).filter((m): m is MessageRow => m !== null);
+    return this.mapRows(raw);
+  }
+
+  /** Whether a ZSORT < 0 row has a regular copy that should win over it. */
+  hasRegularCopy(row: MessageRow): boolean {
+    if (!row.stanza || !this.has('ZWAMESSAGE', 'ZSORT', 'ZSTANZAID')) return false;
+    return (
+      this.db
+        .prepare(
+          'SELECT 1 FROM ZWAMESSAGE WHERE ZCHATSESSION = ? AND ZSTANZAID = ? AND ZISFROMME = ? AND COALESCE(ZSORT, 0) >= 0 LIMIT 1',
+        )
+        .get(row.chatPk, row.stanza, row.input.fromSelf ? 1 : 0) !== undefined
+    );
+  }
+
+  private mapRows(raw: Row[]): { rows: MessageRow[]; snapshot: ChatSnapshot | null } {
+    // A chat created after the last snapshot: read the chat list again in this
+    // same transaction, or its first messages would be dropped for good.
+    const unknown = raw.some((r) => r.ZCHATSESSION != null && !this.sessions.has(Number(r.ZCHATSESSION)));
+    const snapshot = unknown ? this.snapshot() : null;
+
+    const quotes = new Map<MessageRow, Quote>();
+    const rows: MessageRow[] = [];
+    for (const r of raw) {
+      const row = this.toMessage(r);
+      if (!row) continue;
+      rows.push(row);
+      const quote = r.MI_ZMETADATA instanceof Uint8Array ? decodeQuote(r.MI_ZMETADATA) : null;
+      if (quote) quotes.set(row, quote);
+    }
+    if (quotes.size) this.linkReplies(quotes);
+    return { rows, snapshot };
+  }
+
+  /**
+   * A reply's metadata names the quoted message's stanza id; its direction
+   * (which decides the `me_` prefix) comes from the quoted row itself.
+   */
+  private linkReplies(quotes: Map<MessageRow, Quote>): void {
+    const direction = new Map<string, boolean>();
+    if (this.columnsOf('ZWAMESSAGE').has('ZSTANZAID')) {
+      const stanzas = [...new Set([...quotes.values()].map((q) => q.stanza))];
+      for (let i = 0; i < stanzas.length; i += 500) {
+        const chunk = stanzas.slice(i, i + 500);
+        const found = this.db
+          .prepare(
+            `SELECT ZSTANZAID AS stanza, ZCHATSESSION AS chat, ZISFROMME AS me FROM ZWAMESSAGE WHERE ZSTANZAID IN (${chunk.map(() => '?').join(', ')})`,
+          )
+          .all(...chunk);
+        for (const f of found) direction.set(`${Number(f.chat)}\0${String(f.stanza)}`, Number(f.me) === 1);
+      }
+    }
+    for (const [row, quote] of quotes) {
+      // Not on this Mac: the quote's sender is absent for your own messages.
+      const fromSelf = direction.get(`${row.chatPk}\0${quote.stanza}`) ?? quote.senderJid === null;
+      row.input.replyToNativeId = `${fromSelf ? 'me_' : ''}${quote.stanza}`;
+    }
   }
 
   /** Local path of a media item, relative to the container's Message folder. */
@@ -386,7 +535,7 @@ export class ChatStorageReader {
 
     const type = Number(r.ZMESSAGETYPE ?? 0);
     const known = MESSAGE_TYPES[type];
-    let text = str(r.ZTEXT);
+    let text = str(r.ZTEXT) ?? known?.fallbackText ?? null;
     if (!known && !text) return null;
     const kind: MessageKind = known?.kind ?? 'text';
     if (kind === 'system' && !text) return null; // group events without rendered text are noise
@@ -430,7 +579,6 @@ export class ChatStorageReader {
         : [];
 
     const stanza = str(r.ZSTANZAID);
-    const parent = str(r.P_ZSTANZAID);
     const deleted = known?.deleted ?? false;
     const input: MessageInput = {
       conversationNativeId: chat.jid,
@@ -444,7 +592,7 @@ export class ChatStorageReader {
       text: deleted ? null : text,
       attachments: deleted ? [] : attachments,
       reactions,
-      replyToNativeId: parent ? `${Number(r.P_ZISFROMME) === 1 ? 'me_' : ''}${parent}` : null,
+      replyToNativeId: null,
       deleted,
     };
     return {
@@ -452,7 +600,9 @@ export class ChatStorageReader {
       input,
       mediaRef: deleted ? null : mediaRef,
       duplicate: Number(r.ZSORT ?? 0) < 0,
-      state: { type, text, media: str(r.MI_ZMEDIALOCALPATH) },
+      state: { type, text, media: str(r.MI_ZMEDIALOCALPATH), reactions: JSON.stringify(reactions) },
+      chatPk: Number(r.ZCHATSESSION),
+      stanza,
     };
   }
 }

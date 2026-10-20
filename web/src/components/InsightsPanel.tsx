@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react';
 import { api, type Conversation, type ConversationStats } from '../api';
+import { effectiveGroup } from '../../../src/core/groups';
 import { subscribe } from '../events';
+import { GroupMetricsCard } from './GroupMetricsCard';
 import { duration, fullDate, plural } from '../format';
 
 interface Props {
@@ -9,6 +11,7 @@ interface Props {
   onClose?: () => void;
   onError: (message: string) => void;
   onDeleted: () => void;
+  now: number;
 }
 
 const RANGES = [
@@ -22,7 +25,9 @@ const SERIES_SLOTS = 8;
 const HOURS = ['12am', '6am', '12pm', '6pm'];
 const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
-export function InsightsPanel({ conversation, onClose, onError, onDeleted }: Props) {
+export function InsightsPanel({ conversation, onClose, onError, onDeleted, now }: Props) {
+  // Group metrics change when the group does, including on its own (a ghost, a date passing).
+  const groupKey = `${effectiveGroup(conversation, now)}:${conversation.dateAt}`;
   const [stats, setStats] = useState<ConversationStats | null>(null);
   const [range, setRange] = useState(0);
   const [copied, setCopied] = useState(false);
@@ -43,13 +48,13 @@ export function InsightsPanel({ conversation, onClose, onError, onDeleted }: Pro
       clearTimeout(timer);
       unsubscribe();
     };
-  }, [conversation.id, onError]);
+  }, [conversation.id, groupKey, onError]);
 
   const hasSelf = conversation.participants.some((p) => p.isSelf);
-  // Colour follows the person (their position in the participant list), never their rank.
   // Colour follows the person, never their rank: you are always the first colour,
   // everyone else keeps their place in the participant list.
   const order = [
+    ...conversation.participants.filter((p) => p.isSelf).map((p) => p.id),
     ...(stats?.participants.filter((p) => p.isSelf).map((p) => p.id) ?? []),
     ...conversation.participants.filter((p) => !p.isSelf).map((p) => p.id),
     ...(stats?.participants.filter((p) => !p.isSelf).map((p) => p.id) ?? []),
@@ -117,6 +122,8 @@ export function InsightsPanel({ conversation, onClose, onError, onDeleted }: Pro
             </p>
           </section>
         )}
+
+        {stats && <GroupMetricsCard metrics={stats.groupMetrics} now={now} />}
 
         {stats && stats.totalMessages > 0 ? (
           <>

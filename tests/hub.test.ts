@@ -72,6 +72,60 @@ describe('Hub', () => {
     expect(hub.requireConversation('wa:alice').lastMessagePreview).toBe('You: Message deleted');
   });
 
+  it('lets an authoritative mirror replace text, marking the change as an edit', () => {
+    const { hub } = makeHub();
+    const live = { countUnread: false, authoritative: true };
+    hub.upsertMessages('wa', 'live', [msg()], live);
+    hub.upsertMessages('wa', 'live', [msg({ text: 'edit one', edited: true })], live);
+    // Edited again while nothing was watching: a re-read just has the new text.
+    hub.upsertMessages('wa', 'live', [msg({ text: 'edit two' })], live);
+    expect(hub.store.getMessage('wa:alice:m1')).toMatchObject({ text: 'edit two', edited: true });
+    // A caption arriving where there was no text isn't an edit.
+    hub.upsertMessages('wa', 'live', [msg({ nativeId: 'm2', text: null, kind: 'media' })], live);
+    hub.upsertMessages('wa', 'live', [msg({ nativeId: 'm2', text: 'caption', kind: 'media' })], live);
+    expect(hub.store.getMessage('wa:alice:m2')).toMatchObject({ text: 'caption', edited: false });
+  });
+
+  it('clears text and attachments when a delete arrives as an upsert', () => {
+    const { hub } = makeHub();
+    hub.upsertMessages('wa', 'live', [msg({ kind: 'media', attachments: [{ type: 'image', url: '/x' }] })], {
+      countUnread: false,
+    });
+    hub.upsertMessages('wa', 'live', [msg({ text: null, attachments: [], deleted: true })], { countUnread: false });
+    expect(hub.store.getMessage('wa:alice:m1')).toMatchObject({ deleted: true, text: null, attachments: [] });
+  });
+
+  it('replaces reactions with what the source reports, and keeps them when it reports none', () => {
+    const { hub } = makeHub();
+    const heart = { emoji: '❤️', senderId: 'bob', senderName: 'Bob' };
+    hub.upsertMessages('wa', 'live', [msg({ reactions: [heart] })], { countUnread: false });
+    hub.upsertMessages('wa', 'live', [msg()], { countUnread: false });
+    expect(hub.store.getMessage('wa:alice:m1')!.reactions).toEqual([heart]);
+    hub.upsertMessages('wa', 'live', [msg({ reactions: [] })], { countUnread: false });
+    expect(hub.store.getMessage('wa:alice:m1')!.reactions).toEqual([]);
+  });
+
+  it('folds one conversation into another, keeping the more recent group and missing messages', () => {
+    const { hub, events } = makeHub();
+    hub.upsertMessages('wa', 'live', [msg({ conversationNativeId: 'lid', nativeId: 'a', timestamp: 5_000 })], {
+      countUnread: false,
+    });
+    hub.upsertMessages('wa', 'live', [msg({ conversationNativeId: 'phone', nativeId: 'b', timestamp: 1_000 })], {
+      countUnread: false,
+    });
+    hub.setGroup('wa:lid', { group: 'romantic' }, 10_000);
+    hub.retireConversation('wa', 'lid', 'phone');
+    expect(hub.store.getConversation('wa:lid')).toBeUndefined();
+    expect(hub.requireConversation('wa:phone')).toMatchObject({
+      group: 'romantic',
+      groupSetAt: 10_000,
+      messageCount: 2,
+      lastMessageAt: 5_000,
+    });
+    expect(events).toContainEqual({ type: 'conversation.deleted', conversationId: 'wa:lid' });
+    hub.retireConversation('wa', 'lid', 'phone'); // already gone: nothing happens
+  });
+
   it('adds, replaces and removes reactions per sender', () => {
     const { hub } = makeHub();
     hub.upsertMessages('wa', 'live', [msg()], { countUnread: false });

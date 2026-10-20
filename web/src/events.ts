@@ -9,6 +9,7 @@ const EVENT_TYPES: HubEvent['type'][] = [
   'message.upserted',
   'messages.bulk',
   'connector.status',
+  'settings.updated',
 ];
 
 const listeners = new Set<(event: ClientEvent) => void>();

@@ -3,13 +3,15 @@ import { homedir } from 'node:os';
 import { join, normalize, sep } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import type { Connector, ConnectorContext, MessageInput } from '../../core/connector';
-import { ChatStorageReader, ContactBook, readContactBook, type MessageRow } from './reader';
+import { ChatStorageReader, ContactBook, readContactBook, type ChatSnapshot, type MessageRow } from './reader';
 
 type RowState = MessageRow['state'];
 
 function sameState(a: RowState, b: RowState): boolean {
-  return a.type === b.type && a.text === b.text && a.media === b.media;
+  return a.type === b.type && a.text === b.text && a.media === b.media && a.reactions === b.reactions;
 }
+
+const nextTick = () => new Promise((resolve) => setImmediate(resolve));
 
 export const DEFAULT_CONTAINER = join(homedir(), 'Library/Group Containers/group.net.whatsapp.WhatsApp.shared');
 
@@ -22,10 +24,12 @@ export interface WhatsAppMacOptions {
   pollMs: number;
 }
 
-/** Rows read per batch during the first sync, so a large history doesn't block the server. */
-const BACKFILL_BATCH = 2000;
-/** How far back to look for edits and deletes on each change. */
+/** Rows read per batch, yielding in between, so a large history doesn't block the server. */
+const BATCH = 2000;
+/** How far back to look for edits, deletes and reactions on each change. */
 const RECENT_WINDOW = 300;
+/** WhatsApp's side databases for names and LID ↔ phone-number mappings. */
+const CONTACT_FILES = ['ContactsV2.sqlite', 'LID.sqlite'];
 
 const PERMISSION_HELP =
   'macOS blocked access to WhatsApp’s data. Click Allow when macOS asks, or, so it stops asking, give the app you run the server from (Terminal, iTerm…) Full Disk Access in System Settings → Privacy & Security, restart it, then press Start.';
@@ -51,12 +55,22 @@ export class WhatsAppMacConnector implements Connector {
   private db?: DatabaseSync;
   private reader?: ChatStorageReader;
   private timer?: NodeJS.Timeout;
+  /** Bumped by start() and stop(), so a sync from an earlier run stops quietly. */
+  private session = 0;
+  private running: Promise<void> = Promise.resolve();
+  private syncing = false;
   private lastPk = 0;
   private lastVersion = -1;
-  private syncing = false;
+  private contacts = new ContactBook();
+  private contactsStamp = '';
   /** Last-seen state of recent rows, to spot edits and deletes (which rewrite rows in place). */
   private readonly recent = new Map<number, RowState>();
   private readonly chatState = new Map<string, string>();
+  /** Conversation each visible chat session maps to, as of the last snapshot. */
+  private sessions = new Map<number, string>();
+  /** Chat sessions whose older rows need reading again: unhidden, or now known by another id. */
+  private readonly rescan = new Set<number>();
+  private folded: ChatSnapshot['folded'] = [];
 
   constructor(private readonly options: WhatsAppMacOptions) {}
 
@@ -69,7 +83,9 @@ export class WhatsAppMacConnector implements Connector {
   }
 
   async start(ctx: ConnectorContext): Promise<void> {
+    const session = ++this.session;
     this.ctx = ctx;
+    this.reset();
     ctx.setStatus({ state: 'starting', detail: 'Opening WhatsApp Desktop’s database' });
     if (!existsSync(this.dbPath)) {
       ctx.setStatus({
@@ -80,7 +96,9 @@ export class WhatsAppMacConnector implements Connector {
     }
     try {
       this.db = this.open(this.dbPath);
-      this.reader = new ChatStorageReader(this.db, this.loadContacts());
+      this.contactsStamp = this.stampContacts();
+      this.contacts = this.loadContacts();
+      this.reader = new ChatStorageReader(this.db, this.contacts);
       const missing = this.reader.missingRequired();
       if (missing.length) {
         throw new Error(
@@ -98,14 +116,21 @@ export class WhatsAppMacConnector implements Connector {
       return;
     }
 
-    await this.sync({ backfill: true });
-    if (this.reader) this.timer = setInterval(() => void this.poll(), this.options.pollMs);
+    // The history read can take a while on a big store; don't hold up the server or other sources.
+    this.running = this.sync(session, true);
+    this.timer = setInterval(() => void this.poll(session), this.options.pollMs);
   }
 
   async stop(): Promise<void> {
+    this.session++;
     clearInterval(this.timer);
     this.timer = undefined;
     this.close();
+  }
+
+  /** Resolves once the sync in progress, if any, has finished. */
+  settled(): Promise<void> {
+    return this.running;
   }
 
   /** Resolve a `media:<pk>` reference to a downloaded file inside WhatsApp's folders. */
@@ -137,6 +162,18 @@ export class WhatsAppMacConnector implements Connector {
     return null;
   }
 
+  private reset(): void {
+    // Start always reads everything again: the store may have been recreated
+    // (signed out and linked again), and re-reading unchanged rows is free.
+    this.lastPk = 0;
+    this.lastVersion = -1;
+    this.recent.clear();
+    this.chatState.clear();
+    this.sessions = new Map();
+    this.rescan.clear();
+    this.folded = [];
+  }
+
   private open(path: string): DatabaseSync {
     const db = new DatabaseSync(path, { readOnly: true, timeout: 5000 });
     db.exec('PRAGMA query_only = 1');
@@ -166,6 +203,20 @@ export class WhatsAppMacConnector implements Connector {
     this.reader = undefined;
   }
 
+  /** Changes whenever WhatsApp writes its contact databases (WAL files included). */
+  private stampContacts(): string {
+    return CONTACT_FILES.flatMap((name) => [name, `${name}-wal`])
+      .map((name) => {
+        try {
+          const stats = statSync(join(this.options.containerDir, name));
+          return `${stats.mtimeMs}:${stats.size}`;
+        } catch {
+          return '-';
+        }
+      })
+      .join('|');
+  }
+
   private loadContacts(): ContactBook {
     const openOptional = (name: string) => {
       const path = join(this.options.containerDir, name);
@@ -177,8 +228,7 @@ export class WhatsAppMacConnector implements Connector {
         return undefined;
       }
     };
-    const contacts = openOptional('ContactsV2.sqlite');
-    const lid = openOptional('LID.sqlite');
+    const [contacts, lid] = CONTACT_FILES.map(openOptional);
     try {
       return readContactBook(contacts, lid);
     } catch (err) {
@@ -190,69 +240,102 @@ export class WhatsAppMacConnector implements Connector {
     }
   }
 
-  private async poll(): Promise<void> {
-    if (!this.reader || this.syncing) return;
+  /** Reload names and LID mappings when WhatsApp has written them; queue groups whose senders changed id. */
+  private refreshContacts(): boolean {
+    const stamp = this.stampContacts();
+    if (stamp === this.contactsStamp) return false;
+    this.contactsStamp = stamp;
+    const before = this.contacts.lidToPhone;
+    this.contacts = this.loadContacts();
+    const remapped = new Set(
+      [...this.contacts.lidToPhone].filter(([lid, phone]) => before.get(lid) !== phone).map(([lid]) => lid),
+    );
+    this.reader!.setContacts(this.contacts);
+    // Group messages from these people were stored under their LID.
+    if (remapped.size && this.lastPk > 0) for (const pk of this.reader!.groupsWith(remapped)) this.rescan.add(pk);
+    return true;
+  }
+
+  private async poll(session: number): Promise<void> {
+    if (!this.reader || this.syncing || session !== this.session) return;
     try {
-      if (this.reader.dataVersion() === this.lastVersion) return;
-      await this.sync({ backfill: false });
+      const contactsChanged = this.refreshContacts();
+      if (!contactsChanged && this.reader.dataVersion() === this.lastVersion) return;
+      this.running = this.sync(session, false);
+      await this.running;
     } catch (err) {
       this.ctx?.log('warn', 'Poll failed', err);
     }
   }
 
-  private async sync({ backfill }: { backfill: boolean }): Promise<void> {
+  private async sync(session: number, backfill: boolean): Promise<void> {
     const ctx = this.ctx!;
     const reader = this.reader!;
+    const live = () => session === this.session;
     this.syncing = true;
     try {
+      // Read before anything else, so a commit during the sync triggers another one.
       this.lastVersion = reader.dataVersion();
-      const { chats, members } = this.read(() => ({ chats: reader.readChats(), members: reader.readGroupMembers() }));
-      for (const chat of chats) {
-        const participants = members.get(chat.input.nativeId);
-        const input = participants
-          ? { ...chat.input, participants: [...participants, ...(chat.input.participants ?? [])] }
-          : chat.input;
-        const key = JSON.stringify(input);
-        if (this.chatState.get(chat.input.nativeId) === key) continue;
-        this.chatState.set(chat.input.nativeId, key);
-        ctx.upsertConversation(input);
-      }
+      this.applySnapshot(this.read(() => reader.snapshot()));
 
-      // New rows since last time, in batches.
+      // New rows since last time, in batches. Rows that don't map still move the cursor on.
       let total = 0;
       for (;;) {
-        const batch = this.read(() => reader.readMessagesAfter(this.lastPk, BACKFILL_BATCH));
-        if (batch.length === 0) break;
-        this.ingest(batch);
-        this.lastPk = batch.at(-1)!.pk;
-        total += batch.length;
-        if (backfill) {
+        const batch = this.read(() => reader.readMessages({ afterPk: this.lastPk, limit: BATCH }));
+        if (batch.snapshot) this.applySnapshot(batch.snapshot);
+        this.ingest(batch.rows);
+        this.lastPk = batch.lastPk;
+        total += batch.rows.length;
+        if (batch.scanned < BATCH) break;
+        if (backfill)
           ctx.setStatus({ state: 'starting', detail: `Reading history… ${total.toLocaleString()} messages` });
-          await new Promise((resolve) => setImmediate(resolve));
-        }
-        if (batch.length < BACKFILL_BATCH) break;
+        await nextTick();
+        if (!live()) return;
       }
-      // Skipped rows (status updates, group events) can sit past the last mapped row.
-      this.lastPk = Math.max(
-        this.lastPk,
-        this.read(() => reader.maxMessagePk()),
-      );
 
-      // Edits and deletes rewrite existing rows rather than adding new ones.
+      // Older rows of chats that just appeared or changed id.
+      for (const chat of [...this.rescan]) {
+        this.rescan.delete(chat);
+        for (let afterPk = 0; ;) {
+          const batch = this.read(() =>
+            reader.readMessages({ afterPk, untilPk: this.lastPk, limit: BATCH, chats: [chat] }),
+          );
+          if (batch.snapshot) this.applySnapshot(batch.snapshot);
+          this.ingest(batch.rows);
+          afterPk = batch.lastPk;
+          if (batch.scanned < BATCH) break;
+          await nextTick();
+          if (!live()) return;
+        }
+      }
+
+      // Edits, deletes and reactions rewrite existing rows rather than adding new ones.
+      const recent = this.read(() => reader.readRecentMessages(RECENT_WINDOW));
+      if (recent.snapshot) this.applySnapshot(recent.snapshot);
       const changed: MessageRow[] = [];
-      for (const row of this.read(() => reader.readRecentMessages(RECENT_WINDOW))) {
+      for (const row of recent.rows) {
         const before = this.recent.get(row.pk);
-        if (!before || sameState(before, row.state)) continue;
-        const edited = !row.input.deleted && before.text !== null && before.text !== row.state.text;
+        if (before && sameState(before, row.state)) continue;
+        // Rows seen for the first time (a chat that only now maps, say) go in as they are.
+        const edited = !!before && !row.input.deleted && before.text !== null && before.text !== row.state.text;
         changed.push(edited ? { ...row, input: { ...row.input, edited: true } } : row);
       }
-      if (changed.length) this.ingest(changed);
+      if (changed.length) {
+        // A changed ZSORT < 0 row is the message itself, unless a regular copy exists.
+        const updates = this.read(() => changed.filter((row) => !row.duplicate || !reader.hasRegularCopy(row)));
+        this.ingest(updates.map((row) => ({ ...row, duplicate: false })));
+      }
+
+      // Fold LID chats into their phone-number conversations once their rows have moved.
+      for (const { from, into } of this.folded) ctx.retireConversation(from, into);
+      this.folded = [];
 
       ctx.setStatus({
         state: 'connected',
-        detail: `Watching ${chats.length.toLocaleString()} chats · reply in WhatsApp`,
+        detail: `Watching ${this.sessions.size.toLocaleString()} chats · reply in WhatsApp`,
       });
     } catch (err) {
+      if (!live()) return; // stopped mid-read
       const permission = isPermissionError(err);
       ctx.setStatus({
         state: permission ? 'needs_setup' : 'error',
@@ -260,30 +343,45 @@ export class WhatsAppMacConnector implements Connector {
       });
       ctx.log('error', 'Sync failed', err);
     } finally {
-      this.syncing = false;
+      if (live()) this.syncing = false;
     }
   }
 
+  private applySnapshot(snapshot: ChatSnapshot): void {
+    for (const chat of snapshot.chats) {
+      const key = JSON.stringify(chat.input);
+      if (this.chatState.get(chat.input.nativeId) === key) continue;
+      this.chatState.set(chat.input.nativeId, key);
+      this.ctx!.upsertConversation(chat.input);
+    }
+    // A chat that was hidden, or is now known by its phone number, has rows behind the cursor.
+    if (this.lastPk > 0) {
+      for (const [pk, jid] of snapshot.sessions) if (this.sessions.get(pk) !== jid) this.rescan.add(pk);
+    }
+    this.sessions = snapshot.sessions;
+    this.folded = snapshot.folded;
+  }
+
   private ingest(rows: MessageRow[]): void {
-    // History sync can leave a lower-priority copy of a message; never let it replace the primary.
-    const primary = new Set(
-      rows.filter((r) => !r.duplicate).map((r) => `${r.input.conversationNativeId}\0${r.input.nativeId}`),
-    );
-    const inputs: MessageInput[] = [];
+    if (rows.length === 0) return;
+    const regular: MessageInput[] = [];
+    const copies: MessageInput[] = [];
     for (const row of rows) {
       this.recent.set(row.pk, row.state);
-      if (row.duplicate && primary.has(`${row.input.conversationNativeId}\0${row.input.nativeId}`)) continue;
       const file = row.mediaRef ? this.mediaFile(row.mediaRef.slice('media:'.length)) : null;
-      inputs.push({
+      const input = {
         ...row.input,
         attachments: (row.input.attachments ?? []).map((a) =>
           file && row.mediaRef ? { ...a, url: `/api/connectors/${this.id}/media/${row.mediaRef.slice(6)}` } : a,
         ),
-      });
+      };
+      (row.duplicate ? copies : regular).push(input);
     }
-    this.ctx!.upsertMessages(inputs, { countUnread: false });
+    this.ctx!.upsertMessages(regular, { countUnread: false, authoritative: true });
+    // A ZSORT < 0 copy only fills a gap; it never overwrites the regular row.
+    this.ctx!.upsertMessages(copies, { countUnread: false, onlyIfNew: true });
     // Only the recent window is re-checked, so older state can go.
-    const cutoff = Math.max(this.lastPk, rows.at(-1)?.pk ?? 0) - RECENT_WINDOW * 2;
+    const cutoff = Math.max(this.lastPk, rows.at(-1)!.pk) - RECENT_WINDOW * 2;
     for (const pk of this.recent.keys()) if (pk < cutoff) this.recent.delete(pk);
   }
 }

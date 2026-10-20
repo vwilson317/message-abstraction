@@ -73,15 +73,43 @@ export interface StoredReaction {
 /**
  * Reactions live in ZWAMESSAGEINFO.ZRECEIPTINFO: field 7 holds repeated field 1,
  * each with the sender (2, absent for your own), emoji (3, absent once
- * withdrawn) and a from-me flag (6). Layout per the elt and arraypress readers.
+ * withdrawn), a time in ms (4) and a from-me flag (6). A changed reaction can
+ * leave an older entry behind, so only each sender's latest counts. Layout per
+ * the elt and arraypress readers.
  */
 export function decodeReactions(blob: Uint8Array): StoredReaction[] {
   try {
-    const reactions = new ProtoMessage(blob).message(7)?.messages(1) ?? [];
-    return reactions
-      .map((r) => ({ senderJid: r.uint(6) === 1 ? null : (r.string(2) ?? null), emoji: r.string(3) ?? '' }))
-      .filter((r) => r.emoji);
+    // Keyed by sender ('' for you); a Map keeps each sender where they first reacted.
+    const latest = new Map<string, { emoji: string; at: number }>();
+    for (const r of new ProtoMessage(blob).message(7)?.messages(1) ?? []) {
+      const sender = r.uint(6) === 1 ? '' : (r.string(2) ?? '');
+      const at = r.uint(4) ?? 0;
+      if (at >= (latest.get(sender)?.at ?? -1)) latest.set(sender, { emoji: r.string(3) ?? '', at });
+    }
+    return [...latest].filter(([, r]) => r.emoji).map(([sender, r]) => ({ senderJid: sender || null, emoji: r.emoji }));
   } catch {
     return [];
+  }
+}
+
+export interface Quote {
+  /** Stanza id of the quoted message, in the same chat. */
+  stanza: string;
+  /** Who sent it, as the reply names them (often a LID); absent for your own. */
+  senderJid: string | null;
+}
+
+/**
+ * A reply's context lives in its media item's ZMETADATA, even for plain text:
+ * field 5 is the quoted message's stanza id and field 6 its sender. Layout per
+ * the elt, arraypress and IPED readers.
+ */
+export function decodeQuote(blob: Uint8Array): Quote | null {
+  try {
+    const metadata = new ProtoMessage(blob);
+    const stanza = metadata.string(5);
+    return stanza ? { stanza, senderJid: metadata.string(6) ?? null } : null;
+  } catch {
+    return null;
   }
 }

@@ -20,6 +20,9 @@ const conversation: Conversation = {
   lastMessagePreview: null,
   unreadCount: 0,
   messageCount: 0,
+  group: 'close',
+  dateAt: null,
+  groupSetAt: null,
 };
 
 let n = 0;

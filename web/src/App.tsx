@@ -1,4 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
+import { api, type Conversation, type GroupId } from './api';
+import { GroupMenu } from './components/GroupMenu';
+import { ensureAlertPermission, useAlerts } from './useAlerts';
+import { useNow } from './useNow';
 import { SourcesDialog } from './components/SourcesDialog';
 import { ImportDialog } from './components/ImportDialog';
 import { InsightsPanel } from './components/InsightsPanel';
@@ -20,9 +24,23 @@ export function App() {
   const [showInsights, setShowInsights] = useState(() => window.matchMedia('(min-width: 1200px)').matches);
   const toasts = useToasts();
   const showError = toasts.error;
-  const { conversations, connectors, loaded } = useInbox(showError, (id) =>
+  const { conversations, connectors, settings, loaded } = useInbox(showError, (id) =>
     setSelectedId((current) => (current === id ? null : current)),
   );
+  const now = useNow();
+  const [moving, setMoving] = useState<{ id: string; at: { x: number; y: number } } | null>(null);
+  const movingConversation = moving ? conversations.find((c) => c.id === moving.id) : undefined;
+  const openMove = (c: Conversation, at: { x: number; y: number }) => setMoving({ id: c.id, at });
+
+  useAlerts({ conversations, settings, focusedId: selectedId, onOpen: setSelectedId });
+
+  const toggleAlerts = async (group: GroupId) => {
+    const on = !settings.groupAlerts[group];
+    if (on && !(await ensureAlertPermission())) {
+      showError('Chrome is blocking notifications for this page. Allow them in the site settings to get alerts.');
+    }
+    api.updateSettings({ [group]: on }).catch((err: Error) => showError(err.message));
+  };
 
   // Keep the open conversation in the URL so a reload lands in the same place.
   useEffect(() => {
@@ -38,7 +56,11 @@ export function App() {
       <Sidebar
         conversations={conversations}
         connectors={connectors}
+        settings={settings}
+        now={now}
         loaded={loaded}
+        onMove={openMove}
+        onToggleAlerts={(group) => void toggleAlerts(group)}
         selectedId={selectedId}
         onSelect={setSelectedId}
         onOpenSources={() => setDialog('sources')}
@@ -53,6 +75,8 @@ export function App() {
             insightsOpen: showInsights,
             onToggleInsights: () => setShowInsights((v) => !v),
             onBack: () => setSelectedId(null),
+            now,
+            onMove: (at) => openMove(selected, at),
           }}
           onOpenSources={() => setDialog('sources')}
           onError={showError}
@@ -74,6 +98,7 @@ export function App() {
           onClose={() => setShowInsights(false)}
           onError={showError}
           onDeleted={() => setSelectedId(null)}
+          now={now}
         />
       )}
 
@@ -92,6 +117,16 @@ export function App() {
             setSelectedId(id);
             setDialog(null);
           }}
+        />
+      )}
+      {movingConversation && moving && (
+        <GroupMenu
+          key={movingConversation.id}
+          conversation={movingConversation}
+          at={moving.at}
+          now={now}
+          onClose={() => setMoving(null)}
+          onError={showError}
         />
       )}
       <Toasts items={toasts.items} onDismiss={toasts.dismiss} />

@@ -76,3 +76,31 @@ export function hueFor(name: string): number {
 export function plural(n: number, word: string): string {
   return `${n.toLocaleString()} ${word}${n === 1 ? '' : 's'}`;
 }
+
+/** "Sat, Oct 24 · 8:00 PM" */
+export function dateTime(ts: number): string {
+  const d = new Date(ts);
+  return `${d.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' })} · ${timeOfDay(ts)}`;
+}
+
+/** How long since `ts`, in words: "3 days", "5 hours", "a few minutes". */
+export function sinceLabel(ts: number | null, now: number): string {
+  if (ts === null) return 'a long time';
+  const ms = Math.max(0, now - ts);
+  const minutes = Math.round(ms / 60_000);
+  if (minutes < 5) return 'a few minutes';
+  if (minutes < 60) return `${minutes} minutes`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 48) return plural(hours, 'hour');
+  return plural(Math.round(hours / 24), 'day');
+}
+
+/** "in 3 days", "in 5 hours", "now" for a time ahead. */
+export function untilLabel(ts: number, now: number): string {
+  const ms = ts - now;
+  if (ms <= 0) return 'now';
+  const hours = ms / 3_600_000;
+  if (hours < 1) return `in ${Math.max(1, Math.round(ms / 60_000))} min`;
+  if (hours < 36) return `in ${plural(Math.round(hours), 'hour')}`;
+  return `in ${plural(Math.round(hours / 24), 'day')}`;
+}

@@ -16,7 +16,15 @@ CREATE TABLE IF NOT EXISTS conversations (
   last_message_at      INTEGER,
   last_message_preview TEXT,
   unread_count         INTEGER NOT NULL DEFAULT 0,
-  message_count        INTEGER NOT NULL DEFAULT 0
+  message_count        INTEGER NOT NULL DEFAULT 0,
+  group_id             TEXT NOT NULL DEFAULT 'close',
+  date_at              INTEGER,
+  group_set_at         INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS settings (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -47,6 +55,37 @@ export class Store {
     this.db = new DatabaseSync(path);
     this.db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
     this.db.exec(SCHEMA);
+    this.migrate();
+  }
+
+  /** Bring databases created by earlier versions up to the current schema. */
+  private migrate(): void {
+    const columns = new Set(
+      this.db
+        .prepare('PRAGMA table_info(conversations)')
+        .all()
+        .map((r) => String(r.name)),
+    );
+    if (!columns.has('group_id'))
+      this.db.exec(`ALTER TABLE conversations ADD COLUMN group_id TEXT NOT NULL DEFAULT 'close'`);
+    if (!columns.has('date_at')) this.db.exec('ALTER TABLE conversations ADD COLUMN date_at INTEGER');
+    if (!columns.has('group_set_at')) this.db.exec('ALTER TABLE conversations ADD COLUMN group_set_at INTEGER');
+    // The first version mirrored WhatsApp through its web API as source "whatsapp". Nothing
+    // serves those conversations now, so treat them like imports, which can be deleted.
+    this.db.exec(
+      `UPDATE conversations SET source_kind = 'import' WHERE source_id = 'whatsapp' AND source_kind = 'live'`,
+    );
+  }
+
+  getSetting<T>(key: string): T | undefined {
+    const row = this.db.prepare('SELECT value FROM settings WHERE key = ?').get(key);
+    return row ? (JSON.parse(String(row.value)) as T) : undefined;
+  }
+
+  setSetting(key: string, value: unknown): void {
+    this.db
+      .prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value')
+      .run(key, JSON.stringify(value));
   }
 
   close(): void {
@@ -82,12 +121,14 @@ export class Store {
     this.db
       .prepare(
         `INSERT INTO conversations (id, source_id, source_kind, platform, native_id, title, is_group,
-           participants, last_message_at, last_message_preview, unread_count, message_count)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           participants, last_message_at, last_message_preview, unread_count, message_count,
+           group_id, date_at, group_set_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (id) DO UPDATE SET
            title = excluded.title, is_group = excluded.is_group, participants = excluded.participants,
            last_message_at = excluded.last_message_at, last_message_preview = excluded.last_message_preview,
-           unread_count = excluded.unread_count, message_count = excluded.message_count`,
+           unread_count = excluded.unread_count, message_count = excluded.message_count,
+           group_id = excluded.group_id, date_at = excluded.date_at, group_set_at = excluded.group_set_at`,
       )
       .run(
         c.id,
@@ -102,6 +143,9 @@ export class Store {
         c.lastMessagePreview,
         c.unreadCount,
         c.messageCount,
+        c.group,
+        c.dateAt,
+        c.groupSetAt,
       );
   }
 
@@ -121,7 +165,8 @@ export class Store {
            kind, text, attachments, reactions, reply_to_native_id, status, edited, deleted)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (id) DO UPDATE SET
-           sender_name = excluded.sender_name, from_self = excluded.from_self, timestamp = excluded.timestamp,
+           sender_id = excluded.sender_id, sender_name = excluded.sender_name, from_self = excluded.from_self,
+           timestamp = excluded.timestamp,
            kind = excluded.kind, text = excluded.text, attachments = excluded.attachments,
            reactions = excluded.reactions, reply_to_native_id = excluded.reply_to_native_id,
            status = excluded.status, edited = excluded.edited, deleted = excluded.deleted`,
@@ -189,6 +234,12 @@ export class Store {
       .map(toMessage);
   }
 
+  countMessages(conversationId: string): number {
+    return Number(
+      this.db.prepare('SELECT COUNT(*) AS n FROM messages WHERE conversation_id = ?').get(conversationId)?.n ?? 0,
+    );
+  }
+
   latestMessage(conversationId: string): Message | undefined {
     const row = this.db
       .prepare('SELECT * FROM messages WHERE conversation_id = ? ORDER BY timestamp DESC, rowid DESC LIMIT 1')
@@ -224,6 +275,9 @@ function toConversation(row: Row): Conversation {
     lastMessagePreview: row.last_message_preview === null ? null : String(row.last_message_preview),
     unreadCount: Number(row.unread_count),
     messageCount: Number(row.message_count),
+    group: (row.group_id ?? 'close') as Conversation['group'],
+    dateAt: row.date_at === null || row.date_at === undefined ? null : Number(row.date_at),
+    groupSetAt: row.group_set_at === null || row.group_set_at === undefined ? null : Number(row.group_set_at),
   };
 }
 

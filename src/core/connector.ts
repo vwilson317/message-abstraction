@@ -1,6 +1,7 @@
 import type {
   Attachment,
   ConnectorStatus,
+  Conversation,
   DeliveryStatus,
   MessageKind,
   Participant,
@@ -32,6 +33,7 @@ export interface MessageInput {
   kind: MessageKind;
   text: string | null;
   attachments?: Attachment[];
+  /** The full current list, replacing what's stored; omit when the source can't see reactions. */
   reactions?: Reaction[];
   replyToNativeId?: string | null;
   status?: DeliveryStatus | null;
@@ -56,6 +58,13 @@ export interface MessagePatch {
 export interface UpsertOptions {
   /** Count new messages from others as unread. True for live traffic, false for history backfill. */
   countUnread: boolean;
+  /** Leave messages that already exist alone, e.g. for a lower-priority copy of a message. */
+  onlyIfNew?: boolean;
+  /**
+   * The source shows each message as it is now (a mirror of the app's own
+   * store), so its text replaces the stored text and a change counts as an edit.
+   */
+  authoritative?: boolean;
 }
 
 /**
@@ -63,9 +72,14 @@ export interface UpsertOptions {
  * namespaces ids by connector, persists everything and fans out events.
  */
 export interface ConnectorContext {
-  upsertConversation(input: ConversationInput): void;
+  upsertConversation(input: ConversationInput): Conversation;
   upsertMessages(inputs: MessageInput[], options: UpsertOptions): void;
   patchMessage(patch: MessagePatch): void;
+  /**
+   * The app now knows `from` as `into` (one person, two ids): fold the old
+   * conversation in, keeping its group and any messages `into` lacks.
+   */
+  retireConversation(fromNativeId: string, intoNativeId: string): void;
   setStatus(status: Omit<ConnectorStatus, 'id' | 'platform' | 'label'>): void;
   /** Store media bytes and get back a URL the web client can load. */
   saveMedia(data: Uint8Array, hint: { fileName?: string; mimeType?: string }): string;
@@ -91,7 +105,7 @@ export interface Connector {
   /** Absolute path of a media file the app stores locally, for an attachment URL this connector issued. */
   mediaFile?(ref: string): string | null;
   /** For sources the browser extension pushes into: accept one capture (untrusted JSON). */
-  receive?(body: unknown): { conversationId: string; added: number };
+  receive?(body: unknown): { conversationId: string; added: number; skipped?: string };
   /** For push sources: the extension is alive and a matching tab is open. */
   heartbeat?(): void;
 }

@@ -1,13 +1,18 @@
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import type { Conversation } from './api';
+import { effectiveGroup, GROUPS } from '../../src/core/groups';
 import { Avatar } from './components/Avatar';
+import { GroupChip } from './components/GroupChip';
+import { GroupMenu } from './components/GroupMenu';
 import { InsightsPanel } from './components/InsightsPanel';
 import { Thread } from './components/Thread';
 import { Toasts, useToasts } from './components/Toasts';
 import { subscribe } from './events';
 import { listTime } from './format';
+import { useAlerts } from './useAlerts';
 import { useInbox } from './useInbox';
+import { useNow } from './useNow';
 
 /**
  * A narrow view that sits beside a messaging app and shows the conversation
@@ -49,7 +54,9 @@ function writeFollow(on: boolean): void {
 export function Companion() {
   const toasts = useToasts();
   const showError = toasts.error;
-  const { conversations, connectors, loaded } = useInbox(showError);
+  const { conversations, connectors, settings, loaded } = useInbox(showError);
+  const now = useNow();
+  const [moveAt, setMoveAt] = useState<{ x: number; y: number } | null>(null);
   const [focusedId, setFocusedId] = useState<string | null>(() => decodeURIComponent(location.hash.slice(1)) || null);
   const [follow, setFollow] = useState(() => !embedded && readFollow());
   const [tab, setTab] = useState<Tab>('insights');
@@ -109,7 +116,22 @@ export function Companion() {
   }, [focusedId]);
 
   const focused = useMemo(() => conversations.find((c) => c.id === focusedId) ?? null, [conversations, focusedId]);
-  const choices = useMemo(() => conversations.slice(0, 200), [conversations]);
+  // The picker groups conversations the same way the inbox tabs do.
+  const byGroup = useMemo(
+    () =>
+      GROUPS.map((g) => {
+        const all = conversations.filter((c) => effectiveGroup(c, now) === g.id);
+        const items = all.slice(0, 100);
+        // Keep the open conversation selectable even when it's older than the first 100.
+        const open = all.find((c) => c.id === focusedId);
+        if (open && !items.includes(open)) items.push(open);
+        return { ...g, items };
+      }).filter((g) => g.items.length > 0),
+    [conversations, now, focusedId],
+  );
+
+  // Standalone, the companion can raise alerts; in the side panel the extension's frame can't.
+  useAlerts({ conversations, settings, focusedId, onOpen: setFocusedId, enabled: !embedded });
 
   const choose = (id: string) => {
     setFocusedId(id);
@@ -144,6 +166,7 @@ export function Companion() {
           conversation={focused}
           onError={showError}
           onDeleted={() => setFocusedId(null)}
+          now={now}
         />
       ) : (
         <Thread
@@ -170,11 +193,15 @@ export function Companion() {
           disabled={embedded}
         >
           {!focused && <option value="">{embedded ? 'Instagram' : 'Choose a conversation'}</option>}
-          {choices.map((c: Conversation) => (
-            <option key={c.id} value={c.id}>
-              {c.title} · {c.platform === 'whatsapp' ? 'WhatsApp' : 'Instagram'}
-              {c.sourceKind === 'import' ? ' (imported)' : ''} · {listTime(c.lastMessageAt)}
-            </option>
+          {byGroup.map((g) => (
+            <optgroup key={g.id} label={g.label}>
+              {g.items.map((c: Conversation) => (
+                <option key={c.id} value={c.id}>
+                  {c.title} · {c.platform === 'whatsapp' ? 'WhatsApp' : 'Instagram'}
+                  {c.sourceKind === 'import' ? ' (imported)' : ''} · {listTime(c.lastMessageAt)}
+                </option>
+              ))}
+            </optgroup>
           ))}
         </select>
         {!embedded && (
@@ -209,6 +236,7 @@ export function Companion() {
               {t === 'insights' ? 'Insights' : 'Messages'}
             </button>
           ))}
+          <GroupChip conversation={focused} now={now} onMove={setMoveAt} />
           <a className="companion-open" href={`/#${encodeURIComponent(focused.id)}`} target="_blank" rel="noopener">
             Open in Inbox ↗
           </a>
@@ -249,6 +277,16 @@ export function Companion() {
             </pre>
           )}
         </footer>
+      )}
+      {focused && moveAt && (
+        <GroupMenu
+          key={focused.id}
+          conversation={focused}
+          at={moveAt}
+          now={now}
+          onClose={() => setMoveAt(null)}
+          onError={showError}
+        />
       )}
       <Toasts items={toasts.items} onDismiss={toasts.dismiss} />
     </div>

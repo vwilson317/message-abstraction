@@ -103,7 +103,7 @@ export function computeStats(conversation: Conversation, messages: Message[]): C
     if (gap > SESSION_GAP_MS) {
       sessions++;
       p.initiations++;
-    } else if (previous && previous.senderId !== m.senderId && gap >= MIN_REPLY_MS) {
+    } else if (previous && previous.senderId !== m.senderId && gap > MIN_REPLY_MS) {
       p.replyTimes.push(gap);
     }
     previous = m;

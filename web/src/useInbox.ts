@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { api, type Conversation, type ConnectorStatus } from './api';
+import { api, type Conversation, type ConnectorStatus, type Settings } from './api';
+import { DEFAULT_GROUP_ALERTS } from '../../src/core/groups';
 import { subscribe } from './events';
 
 function sortConversations(list: Conversation[]): Conversation[] {
@@ -13,12 +14,14 @@ export function useInbox(onError: (message: string) => void, onDeleted?: (conver
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [connectors, setConnectors] = useState<ConnectorStatus[]>([]);
   const [loaded, setLoaded] = useState(false);
+  const [settings, setSettings] = useState<Settings>({ groupAlerts: DEFAULT_GROUP_ALERTS });
 
   const refresh = useCallback(async () => {
     try {
-      const [convs, conns] = await Promise.all([api.conversations(), api.connectors()]);
+      const [convs, conns, prefs] = await Promise.all([api.conversations(), api.connectors(), api.settings()]);
       setConversations(sortConversations(convs));
       setConnectors(conns);
+      setSettings(prefs);
     } catch (err) {
       onError(`Couldn't reach the server: ${(err as Error).message}`);
     } finally {
@@ -42,6 +45,9 @@ export function useInbox(onError: (message: string) => void, onDeleted?: (conver
           setConversations((list) => list.filter((c) => c.id !== event.conversationId));
           deletedRef.current?.(event.conversationId);
           break;
+        case 'settings.updated':
+          setSettings(event.settings);
+          break;
         case 'connector.status':
           setConnectors((list) =>
             list.some((c) => c.id === event.status.id)
@@ -53,5 +59,5 @@ export function useInbox(onError: (message: string) => void, onDeleted?: (conver
     });
   }, [refresh]);
 
-  return { conversations, connectors, loaded };
+  return { conversations, connectors, settings, loaded };
 }

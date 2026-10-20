@@ -34,11 +34,10 @@ hub.register(
     'instagram',
     'Instagram (Chrome)',
     'Open instagram.com/direct in Chrome with the Inbox extension installed.',
-    (conversationId, range) =>
-      (range
-        ? store.messagesBetween(conversationId, range.from, range.to, 5000)
-        : store.listMessages(conversationId, { limit: 500 }).messages
-      ).map((m) => ({ nativeId: m.nativeId, signature: signatureOf(m), timestamp: m.timestamp })),
+    (conversationId) =>
+      store
+        .messagesBetween(conversationId, 0, Number.MAX_SAFE_INTEGER, 50_000)
+        .map((m) => ({ nativeId: m.nativeId, signature: signatureOf(m), timestamp: m.timestamp })),
   ),
 );
 

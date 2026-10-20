@@ -9,6 +9,8 @@ chatting in the apps.
   runs. New messages, edits and deletes show up within a couple of seconds.
 - **Instagram (Chrome):** a small extension reads the conversation you have open, straight
   from the page, and puts a side panel next to it.
+- **Groups:** Close friends, Romantic interests, Dates and Ghosts, each with its own
+  metrics and alert setting. Press and hold a conversation to move it.
 - **Insights:** who talks more, who reaches out first, reply times, when you talk, how it
   changes month to month. Plus a one-click, LLM-ready transcript of any range. This panel
   is where the AI assistant will plug in.
@@ -74,6 +76,24 @@ npm run import -- chat.txt --self "Your Name" --date-order MDY
 - **Instagram:** Accounts Center → Your information and permissions → Download your
   information → Messages, format **JSON**.
 
+## Groups
+
+Tabs at the top of the inbox sort conversations into four groups. Press and hold a
+conversation (or right-click it, or press Shift+F10) to move it.
+
+| Group                  | Who's in it                                                                                                                      | Alerts | What it measures                                                                                                                                         |
+| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------- | ------ | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Close friends**      | Everyone, until you move them                                                                                                    | On     | Keeping in touch: when you last talked, your usual gap (and a flag when it's running long), who reaches out, messages a week, streaks                    |
+| **Romantic interests** | People you move here                                                                                                             | Off    | Interest signals over 30 days: who starts conversations, reply times both ways, whether theirs are speeding up, words, questions, double texts, momentum |
+| **Dates**              | A romantic interest you've scheduled a date with, from the move menu. They return to Romantic interests 12 hours after it starts | On     | The lead-up: countdown, messages and who's reached out since you scheduled it, how busy the chat is now compared with before                             |
+| **Ghosts**             | Romantic interests where neither of you has written for 48 hours, or that you moved here by hand (until someone writes again)    | Off    | The silence: how long, who's waiting on whom, how many messages went unanswered, how fast they usually replied, how it ended                             |
+
+Romantic interests and Ghosts are muted: no desktop alerts and no unread badges. The bell
+next to the tabs turns alerts on or off for each group. Desktop alerts come from an open
+Inbox or Companion window, not from the apps themselves, which keep their own
+notifications. A date counts as contact, so someone you just had a date with doesn't
+become a ghost. Search looks across every group.
+
 ## Configuration
 
 All optional. Put them in `.env` or your shell; see [`.env.example`](.env.example).
@@ -101,8 +121,9 @@ All optional. Put them in `.env` or your shell; see [`.env.example`](.env.exampl
   extension's background worker to `localhost`, never from instagram.com.
 - **The server** listens on `127.0.0.1` only. It refuses unexpected `Host` headers (DNS
   rebinding) and cross-site writes (CSRF). The extension's origin is accepted only on the
-  two capture routes. Only the app itself and the extension may frame its pages. There is
-  no login, so don't expose it to a network.
+  two capture routes. Only the app itself and the extension may frame its pages, and
+  other websites can't embed its media. There is no login, so don't expose it to a
+  network.
 - `data/` holds your messages: treat it like a password.
 
 **Terms of service.** WhatsApp and Instagram don't offer this kind of access, and
@@ -122,7 +143,9 @@ it's opt-in.
   - Your own messages are the ones on the right. That assumes a left-to-right UI language.
   - Times come only from Instagram's occasional date dividers, in English. Between
     dividers, message order is exact but times are approximate, so reply-time stats skip
-    them.
+    them. A message that arrives while you watch is dated when it arrives.
+  - A conversation counts as a group chat once the page shows more than one other person
+    in it, and it stays one.
   - View-once messages can't be seen on the web at all.
 
 ## Development
