@@ -1,0 +1,47 @@
+{
+  "name": "message-abstraction",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A unified inbox over WhatsApp and Instagram DMs, with a seam for conversation insights.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.16"
+  },
+  "scripts": {
+    "dev": "concurrently -k -n server,web -c blue,magenta \"npm:dev:server\" \"npm:dev:web\"",
+    "dev:server": "NODE_OPTIONS=--disable-warning=ExperimentalWarning tsx watch --clear-screen=false src/main.ts",
+    "dev:web": "vite",
+    "build": "vite build && node scripts/build-extension.mjs",
+    "start": "NODE_OPTIONS=--disable-warning=ExperimentalWarning NODE_ENV=production tsx src/main.ts",
+    "import": "NODE_OPTIONS=--disable-warning=ExperimentalWarning tsx src/cli/import.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p extension/tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "format": "prettier --write src web/src tests extension scripts",
+    "format:check": "prettier --check src web/src tests extension scripts",
+    "build:extension": "node scripts/build-extension.mjs"
+  },
+  "dependencies": {
+    "@hono/node-server": "^2.1.5",
+    "fflate": "^0.8.3",
+    "hono": "^4.13.13",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.3.5",
+    "@types/node": "^22.20.5",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.2",
+    "concurrently": "^10.0.6",
+    "esbuild": "^0.28.2",
+    "happy-dom": "^21.0.3",
+    "prettier": "^3.9.10",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.4",
+    "vitest": "^5.0.5"
+  }
+}

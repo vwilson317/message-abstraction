@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Inbox</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #f4f4f2;
+        --text: #121211;
+        --muted: #85847e;
+        --accent: #2a78d6;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #111110;
+          --text: #f0efec;
+          --muted: #8e8d85;
+          --accent: #3987e5;
+        }
+      }
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font:
+          14px/1.45 system-ui,
+          -apple-system,
+          sans-serif;
+      }
+      iframe {
+        display: block;
+        width: 100%;
+        height: 100%;
+        border: 0;
+      }
+      .setup {
+        padding: 20px;
+      }
+      .setup h1 {
+        font-size: 16px;
+        margin: 0 0 8px;
+      }
+      .setup p {
+        color: var(--muted);
+        margin: 8px 0;
+      }
+      .setup code {
+        font-size: 12px;
+      }
+      .setup input {
+        width: 100%;
+        box-sizing: border-box;
+        margin-top: 4px;
+        padding: 6px 8px;
+        font: inherit;
+      }
+      .setup button {
+        margin-top: 10px;
+        padding: 6px 12px;
+        font: inherit;
+        color: #fff;
+        background: var(--accent);
+        border: 0;
+        border-radius: 6px;
+        cursor: pointer;
+      }
+      [hidden] {
+        display: none !important;
+      }
+    </style>
+  </head>
+  <body>
+    <iframe id="app" title="Inbox" hidden></iframe>
+    <div class="setup" id="setup" hidden>
+      <h1>Inbox isn’t running</h1>
+      <p>Start it from the project folder with <code>npm start</code>, then this panel connects on its own.</p>
+      <label>
+        Server address
+        <input id="server" type="url" spellcheck="false" />
+      </label>
+      <button id="save">Save and retry</button>
+    </div>
+    <script src="sidepanel.js"></script>
+  </body>
+</html>
